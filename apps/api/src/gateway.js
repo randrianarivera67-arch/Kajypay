@@ -51,6 +51,18 @@ export async function gererGateway(request, env, url) {
     await db(env, [{ sql: "UPDATE appareils SET dernier_contact = ? WHERE id = ?", args: [Date.now(), app.id] }]);
     return json({ ok: true, sims: await lignes(env, app.id) });
   }
+  if (p === "/gateway/sims") {
+    const { sims } = await lireCorps(request);
+    if (!Array.isArray(sims) || sims.length > 4) return json({ ok: false, erreur: "liste sims invalide" }, 400);
+    const ops = ["mvola", "orange", "airtel"], now = Date.now(), stmts = [];
+    for (const slot of [1, 2]) {
+      const x = sims.find(v => v?.slot === slot && ops.includes(v?.operateur));
+      if (x) stmts.push({ sql: "INSERT INTO lignes_sim (id, appareil_id, slot, operateur, numero, actif, cree_le) VALUES (?, ?, ?, ?, NULL, 1, ?) ON CONFLICT(appareil_id, slot) DO UPDATE SET operateur = excluded.operateur, actif = 1", args: [crypto.randomUUID(), app.id, slot, x.operateur, now] });
+      else stmts.push({ sql: "UPDATE lignes_sim SET actif = 0 WHERE appareil_id = ? AND slot = ?", args: [app.id, slot] });
+    }
+    await dbTx(env, stmts);
+    return json({ ok: true, sims: await lignes(env, app.id) });
+  }
   if (p === "/gateway/sms") {
     const { sms } = await lireCorps(request);
     if (!Array.isArray(sms) || sms.length < 1 || sms.length > 50) return json({ ok: false, erreur: "liste sms invalide (1 a 50)" }, 400);

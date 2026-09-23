@@ -38,6 +38,24 @@ public final class Sync {
         }
     }
 
+    public static synchronized boolean synchroniserSims(Context c) {
+        Store s = new Store(c);
+        if (!s.estAppaire()) return false;
+        JSONArray d = SimsDetect.detecter(c);
+        if (d == null) return false;
+        String k = d.toString();
+        if (k.equals(s.simsEnvoyees())) return false;
+        try {
+            JSONObject r = new JSONObject(Api.post(s.api() + "/gateway/sims", new JSONObject().put("sims", d).toString(), "Appareil " + s.jeton()));
+            if (!r.optBoolean("ok")) return false;
+            s.majSims(r.getJSONArray("sims").toString());
+            s.setSimsEnvoyees(k);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     public static synchronized String ping(Context c) {
         Store s = new Store(c);
         if (!s.estAppaire()) return "Appareil non connecté";

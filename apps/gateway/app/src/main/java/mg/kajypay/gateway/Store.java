@@ -20,5 +20,7 @@ public final class Store {
     public void majSims(String sims) { p.edit().putString("sims", sims).apply(); }
     public void setPause(boolean v) { p.edit().putBoolean("pause", v).apply(); }
     public void setDernierContact(long t) { p.edit().putLong("contact", t).apply(); }
+    public String simsEnvoyees() { return p.getString("sims_env", ""); }
+    public void setSimsEnvoyees(String v) { p.edit().putString("sims_env", v).apply(); }
     public void effacer() { p.edit().clear().apply(); }
 }
