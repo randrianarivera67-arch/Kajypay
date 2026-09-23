@@ -11,12 +11,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: cloudflare/wrangler-action@v3
         with:
+          wranglerVersion: "4"
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: apps/api
           secrets: |
             TURSO_DATABASE_URL
             TURSO_AUTH_TOKEN
+            JWT_SECRET
+            INIT_KEY
         env:
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          INIT_KEY: ${{ secrets.INIT_KEY }}
