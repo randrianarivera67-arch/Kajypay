@@ -22,5 +22,6 @@ public final class Store {
     public void setDernierContact(long t) { p.edit().putLong("contact", t).apply(); }
     public String simsEnvoyees() { return p.getString("sims_env", ""); }
     public void setSimsEnvoyees(String v) { p.edit().putString("sims_env", v).apply(); }
+    public void setAuto(boolean v) { p.edit().putBoolean("auto", v).apply(); }
     public void effacer() { p.edit().clear().apply(); }
 }
