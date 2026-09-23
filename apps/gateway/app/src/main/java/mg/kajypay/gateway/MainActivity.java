@@ -270,8 +270,8 @@ public class MainActivity extends Activity {
 
     String[] permissionsVoulues() {
         return Build.VERSION.SDK_INT >= 33
-            ? new String[]{Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_PHONE_STATE, Manifest.permission.POST_NOTIFICATIONS}
-            : new String[]{Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_PHONE_STATE};
+            ? new String[]{Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_PHONE_STATE, Manifest.permission.CALL_PHONE, Manifest.permission.POST_NOTIFICATIONS}
+            : new String[]{Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_PHONE_STATE, Manifest.permission.CALL_PHONE};
     }
 
     boolean autorisationsOk() {
@@ -347,6 +347,12 @@ public class MainActivity extends Activity {
         }
         if (code == null || code.trim().isEmpty()) {
             Toast.makeText(this, "Aucun code USSD configuré pour la SIM " + slot + ". Réglages > Cartes SIM.", Toast.LENGTH_LONG).show();
+            if (finUi != null) finUi.run();
+            return;
+        }
+        if (checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.CALL_PHONE}, 8);
+            Toast.makeText(this, "Autorisez « Appels téléphoniques » pour lire le solde.", Toast.LENGTH_LONG).show();
             if (finUi != null) finUi.run();
             return;
         }
