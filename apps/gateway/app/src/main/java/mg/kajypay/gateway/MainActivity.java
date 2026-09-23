@@ -31,8 +31,14 @@ import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
-import com.google.zxing.integration.android.IntentIntegrator;
-import com.google.zxing.integration.android.IntentResult;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.SharedPreferences;
+import com.google.mlkit.vision.barcode.common.Barcode;
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions;
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
@@ -71,9 +77,43 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        installerRapportCrash();
         store = new Store(this);
         journal = new Journal(this);
         if (store.estAppaire()) demarrerApp(); else afficherConnexion();
+        afficherDernierCrash();
+    }
+
+    static boolean rapportInstalle = false;
+
+    void installerRapportCrash() {
+        if (rapportInstalle) return;
+        rapportInstalle = true;
+        final SharedPreferences cp = getApplicationContext().getSharedPreferences("crash", MODE_PRIVATE);
+        final Thread.UncaughtExceptionHandler avant = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+            StringWriter sw = new StringWriter();
+            e.printStackTrace(new PrintWriter(sw));
+            cp.edit().putString("trace", "KajyPay " + BuildConfig.VERSION_NAME + "\n" + sw).commit();
+            if (avant != null) avant.uncaughtException(t, e);
+        });
+    }
+
+    void afficherDernierCrash() {
+        SharedPreferences cp = getSharedPreferences("crash", MODE_PRIVATE);
+        String tr = cp.getString("trace", null);
+        if (tr == null) return;
+        cp.edit().remove("trace").apply();
+        final String court = tr.length() > 2500 ? tr.substring(0, 2500) : tr;
+        new AlertDialog.Builder(this)
+            .setTitle("KajyPay s'est arrêté")
+            .setMessage(court)
+            .setNegativeButton("Fermer", null)
+            .setPositiveButton("Copier", (d, w) -> {
+                ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("crash", court));
+                Toast.makeText(this, "Rapport copié", Toast.LENGTH_SHORT).show();
+            })
+            .show();
     }
 
     void demarrerApp() {
@@ -286,11 +326,18 @@ public class MainActivity extends Activity {
         note.addView(nt);
         c.addView(note, plein(28));
         qr.setOnClickListener(v -> {
-            IntentIntegrator ii = new IntentIntegrator(this);
-            ii.setPrompt("Placez le QR code KajyPay dans le cadre");
-            ii.setBeepEnabled(false);
-            ii.setOrientationLocked(false);
-            ii.initiateScan();
+            try {
+                GmsBarcodeScannerOptions o = new GmsBarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build();
+                GmsBarcodeScanning.getClient(this, o).startScan()
+                    .addOnSuccessListener(bc -> {
+                        String brut = bc.getRawValue();
+                        try { brut = new JSONObject(brut).optString("code", brut); } catch (Exception ignore) { }
+                        appairer(brut);
+                    })
+                    .addOnFailureListener(e -> erreurConnexion.setText("Scanner indisponible sur ce téléphone. Saisissez le code à 8 caractères."));
+            } catch (Exception e) {
+                erreurConnexion.setText("Scanner indisponible sur ce téléphone. Saisissez le code à 8 caractères.");
+            }
         });
         okConnexion.setOnClickListener(v -> appairer(code.getText().toString()));
         ScrollView sv = new ScrollView(this);
@@ -298,20 +345,6 @@ public class MainActivity extends Activity {
         sv.setFillViewport(true);
         sv.addView(c);
         setContentView(sv);
-    }
-
-    @Override
-    protected void onActivityResult(int req, int res, Intent data) {
-        IntentResult r = IntentIntegrator.parseActivityResult(req, res, data);
-        if (r != null) {
-            if (r.getContents() != null) {
-                String brut = r.getContents();
-                try { brut = new JSONObject(brut).optString("code", brut); } catch (Exception ignore) { }
-                appairer(brut);
-            }
-            return;
-        }
-        super.onActivityResult(req, res, data);
     }
 
     void appairer(String brut) {
