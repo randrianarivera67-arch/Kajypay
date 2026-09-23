@@ -10,7 +10,7 @@ async function appareilCourant(request, env) {
   return r.rows[0] || null;
 }
 async function lignes(env, appareilId) {
-  const [r] = await db(env, [{ sql: "SELECT slot, operateur, numero, actif FROM lignes_sim WHERE appareil_id = ? ORDER BY slot", args: [appareilId] }]);
+  const [r] = await db(env, [{ sql: "SELECT slot, operateur, numero, actif, code_ussd_solde, solde_operateur_ar, solde_texte, solde_maj FROM lignes_sim WHERE appareil_id = ? ORDER BY slot", args: [appareilId] }]);
   return r.rows;
 }
 function choisirLigne(texte, slot, ls) {
@@ -62,6 +62,13 @@ export async function gererGateway(request, env, url) {
     }
     await dbTx(env, stmts);
     return json({ ok: true, sims: await lignes(env, app.id) });
+  }
+  if (p === "/gateway/solde") {
+    const { slot, montant_ar, texte } = await lireCorps(request);
+    if (![1, 2].includes(slot)) return json({ ok: false, erreur: "slot invalide" }, 400);
+    const m = Number.isInteger(montant_ar) ? montant_ar : null;
+    await db(env, [{ sql: "UPDATE lignes_sim SET solde_operateur_ar = ?, solde_texte = ?, solde_maj = ? WHERE appareil_id = ? AND slot = ?", args: [m, typeof texte === "string" ? texte.slice(0, 300) : null, Date.now(), app.id, slot] }]);
+    return json({ ok: true });
   }
   if (p === "/gateway/sms") {
     const { sms } = await lireCorps(request);

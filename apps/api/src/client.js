@@ -32,7 +32,7 @@ export async function gererClient(request, env, url, u) {
   if (m === "GET" && p === "/client/appareils") {
     const [r, l] = await db(env, [
       { sql: "SELECT id, nom, statut, dernier_contact FROM appareils WHERE client_id = ? ORDER BY cree_le DESC", args: [cid] },
-      { sql: "SELECT l.appareil_id, l.slot, l.operateur, l.numero, l.actif FROM lignes_sim l JOIN appareils a ON a.id = l.appareil_id WHERE a.client_id = ? ORDER BY l.slot", args: [cid] }
+      { sql: "SELECT l.appareil_id, l.slot, l.operateur, l.numero, l.actif, l.code_ussd_solde, l.solde_operateur_ar, l.solde_texte, l.solde_maj FROM lignes_sim l JOIN appareils a ON a.id = l.appareil_id WHERE a.client_id = ? ORDER BY l.slot", args: [cid] }
     ]);
     const now = Date.now();
     return json({ ok: true, appareils: r.rows.map(a => ({ ...a, en_ligne: a.statut === "actif" && !!a.dernier_contact && now - a.dernier_contact < 180000, sims: l.rows.filter(x => x.appareil_id === a.id).map(({ appareil_id, ...x }) => x) })) });
@@ -56,6 +56,17 @@ export async function gererClient(request, env, url, u) {
       { sql: "INSERT INTO codes_appairage (code, appareil_id, expire_le, utilise) VALUES (?, ?, ?, 0)", args: [code, appareilId, now + 15 * 60 * 1000] }
     ]);
     return json({ ok: true, appareil_id: appareilId, code_appairage: code, expire_dans_min: 15, qr: JSON.stringify({ api: url.origin, code }) }, 201);
+  }
+  const mu = p.match(/^\/client\/appareils\/([0-9a-f-]{36})\/sims\/([12])\/ussd$/);
+  if (m === "POST" && mu) {
+    if (u.role !== "client_admin") return json({ ok: false, erreur: "interdit" }, 403);
+    const appareilId = mu[1], slot = Number(mu[2]);
+    const b = await lireCorps(request);
+    const code = txt(b.code_ussd_solde, 60);
+    const [a] = await db(env, [{ sql: "SELECT 1 AS x FROM appareils WHERE id = ? AND client_id = ?", args: [appareilId, cid] }]);
+    if (!a.rows.length) return json({ ok: false, erreur: "appareil introuvable" }, 404);
+    await db(env, [{ sql: "UPDATE lignes_sim SET code_ussd_solde = ? WHERE appareil_id = ? AND slot = ?", args: [code, appareilId, slot] }]);
+    return json({ ok: true });
   }
   const ms = p.match(/^\/client\/appareils\/([0-9a-f-]{36})\/sims\/([12])$/);
   if (m === "POST" && ms) {
