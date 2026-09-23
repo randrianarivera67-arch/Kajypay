@@ -1,6 +1,8 @@
 import { db } from "./db.js";
 import { hacherMotDePasse, verifierMotDePasse, egalSecret, signerJwt, verifierJwt } from "./auth.js";
 import { gererAdmin } from "./admin.js";
+import { gererGateway } from "./gateway.js";
+import { gererClient } from "./client.js";
 const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Init-Key", "Access-Control-Allow-Methods": "GET, POST, OPTIONS" };
 const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json", ...CORS } });
 const lireCorps = async req => { try { return await req.json(); } catch { return {}; } };
@@ -41,6 +43,13 @@ export default {
         const u = await utilisateurCourant(request, env);
         if (!u) return json({ ok: false, erreur: "non connecte" }, 401);
         return json({ ok: true, utilisateur: { id: u.sub, role: u.role, client_id: u.client_id } });
+      }
+      if (url.pathname.startsWith("/gateway/")) return gererGateway(request, env, url);
+      if (url.pathname.startsWith("/client/")) {
+        const u = await utilisateurCourant(request, env);
+        if (!u) return json({ ok: false, erreur: "non connecte" }, 401);
+        if (!["client_admin", "client_staff"].includes(u.role) || !u.client_id) return json({ ok: false, erreur: "interdit" }, 403);
+        return gererClient(request, env, url, u);
       }
       if (url.pathname.startsWith("/admin/")) {
         const u = await utilisateurCourant(request, env);
