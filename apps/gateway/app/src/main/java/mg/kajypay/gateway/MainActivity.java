@@ -15,6 +15,9 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.content.BroadcastReceiver;
+import android.content.IntentFilter;
+import android.os.BatteryManager;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputFilter;
@@ -60,7 +63,7 @@ public class MainActivity extends Activity {
     private String histoQ = "";
     private ScrollView scroll;
     private LinearLayout contenu, liste, alerte, batterie, listeHisto;
-    private TextView etat, simLabel, montant, nombre, contact, info, resumeHisto, erreurConnexion;
+    private TextView etat, simLabel, montant, nombre, contact, batterieTxt, info, resumeHisto, erreurConnexion;
     private Button pauseBtn, okConnexion;
     private final List<Button> navBoutons = new ArrayList<>();
     private final List<LinearLayout> onglets = new ArrayList<>();
@@ -197,6 +200,62 @@ public class MainActivity extends Activity {
         if ("mvola".equals(op)) return Color.parseColor("#FFC20E");
         if ("airtel".equals(op)) return Color.parseColor("#E4002B");
         return MUTED;
+    }
+
+    static int nomRessourceOp(String op) {
+        if ("orange".equals(op)) return R.drawable.ic_op_orange;
+        if ("mvola".equals(op)) return R.drawable.ic_op_mvola;
+        if ("airtel".equals(op)) return R.drawable.ic_op_airtel;
+        return 0;
+    }
+
+    static String initialeOp(String op) {
+        if ("orange".equals(op)) return "O";
+        if ("mvola".equals(op)) return "M";
+        if ("airtel".equals(op)) return "A";
+        return "?";
+    }
+
+    boolean logoExiste(int res) {
+        try { return res != 0 && getResources().getResourceName(res) != null && getDrawable(res) != null; }
+        catch (Exception e) { return false; }
+    }
+
+    View pastilleOp(String op, int taille) {
+        int res = nomRessourceOp(op);
+        if (logoExiste(res)) {
+            ImageView v = new ImageView(this);
+            v.setImageResource(res);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(taille), dp(taille));
+            v.setLayoutParams(lp);
+            return v;
+        }
+        TextView t = texte(initialeOp(op), taille > 30 ? 15 : 12, Color.WHITE, true);
+        t.setGravity(Gravity.CENTER);
+        int s = dp(taille);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(s, s);
+        t.setLayoutParams(lp);
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.OVAL);
+        g.setColor(couleurOp(op));
+        t.setBackground(g);
+        return t;
+    }
+
+    String texteBatterie() {
+        try {
+            BatteryManager bm = getSystemService(BatteryManager.class);
+            int n = bm != null ? bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) : -1;
+            IntentFilter f = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+            Intent b = registerReceiver(null, f);
+            boolean charge = false;
+            if (b != null) {
+                int st = b.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+                charge = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL;
+            }
+            if (n < 0) return "";
+            return "Batterie " + n + "%" + (charge ? " (en charge)" : "");
+        } catch (Exception e) { return ""; }
     }
 
     static String ar(long v) { return String.format(Locale.FRANCE, "%,d", v).replace('\u202f', ' ').replace('\u00a0', ' '); }
@@ -487,9 +546,7 @@ public class MainActivity extends Activity {
             o.setPadding(dp(10), dp(10), dp(10), dp(10));
             o.setMinimumHeight(dp(56));
             o.setClickable(true);
-            View barre = new View(this);
-            barre.setBackground(fond(couleurOp(op), 3, 0, 0));
-            o.addView(barre, new LinearLayout.LayoutParams(dp(8), dp(28)));
+            o.addView(pastilleOp(op, 28));
             LinearLayout col = colonne();
             col.setPadding(dp(10), 0, dp(6), 0);
             col.addView(texte("SIM " + slot, 14, TEXT, true));
@@ -511,7 +568,11 @@ public class MainActivity extends Activity {
         contenu.addView(rangee, plein(16));
 
         LinearLayout hero = colonne();
-        hero.setBackground(fond(ACCENT, 22, 0, 0));
+        GradientDrawable heroFond = new GradientDrawable();
+        heroFond.setColor(ACCENT);
+        heroFond.setCornerRadius(dp(22));
+        heroFond.setStroke(dp(3), Color.parseColor("#F2C14E"));
+        hero.setBackground(heroFond);
         hero.setPadding(dp(20), dp(18), dp(20), dp(20));
         etat = texte("", 14, Color.WHITE, true);
         hero.addView(etat);
@@ -524,6 +585,8 @@ public class MainActivity extends Activity {
         hero.addView(nombre);
         contact = texte("", 12, Color.parseColor("#CFE9DC"), false);
         hero.addView(contact, plein(8));
+        batterieTxt = texte("", 12, Color.parseColor("#CFE9DC"), false);
+        hero.addView(batterieTxt, plein(2));
         contenu.addView(hero, plein(14));
 
         LinearLayout actions = new LinearLayout(this);
@@ -591,6 +654,7 @@ public class MainActivity extends Activity {
         montant.setText(ar(j[1]) + " Ar");
         nombre.setText(j[0] + (j[0] > 1 ? " paiements confirmés" : " paiement confirmé") + (att > 0 ? ", " + att + " en attente d'envoi" : ""));
         contact.setText(texteContact());
+        if (batterieTxt != null) batterieTxt.setText(texteBatterie());
         liste.removeAllViews();
         List<Journal.Ligne> ls = journal.rechercher(simChoisie, 0, null, true, 5);
         if (ls.isEmpty()) { liste.addView(texte("Aucun paiement reçu sur la SIM " + simChoisie + " pour le moment.", 14, MUTED, false), plein(6)); return; }
