@@ -1,0 +1,22 @@
+name: Deploy API
+on:
+  push:
+    branches: [main]
+    paths: ["apps/api/src/**", "apps/api/wrangler.toml", ".github/workflows/deploy-api.yml"]
+  workflow_dispatch:
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: apps/api
+          secrets: |
+            TURSO_DATABASE_URL
+            TURSO_AUTH_TOKEN
+        env:
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
