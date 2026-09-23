@@ -6,11 +6,26 @@ android {
         applicationId "mg.kajypay.gateway"
         minSdk 24
         targetSdk 34
-        versionCode 6
-        versionName "0.5.1"
+        versionCode 7
+        versionName "0.5.2"
     }
     buildFeatures { buildConfig true }
-    buildTypes { release { minifyEnabled false } }
+    signingConfigs {
+        stable {
+            storeFile file(System.getenv("KEYSTORE_FILE") ?: "absent.p12")
+            storePassword System.getenv("KEYSTORE_PASS") ?: ""
+            keyAlias "kajypay"
+            keyPassword System.getenv("KEYSTORE_PASS") ?: ""
+            storeType "pkcs12"
+        }
+    }
+    buildTypes {
+        debug { if (System.getenv("KEYSTORE_FILE") != null) signingConfig signingConfigs.stable }
+        release {
+            minifyEnabled false
+            if (System.getenv("KEYSTORE_FILE") != null) signingConfig signingConfigs.stable
+        }
+    }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17

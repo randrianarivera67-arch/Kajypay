@@ -16,9 +16,24 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
+      - name: Keystore
+        env:
+          KS: ${{ secrets.KEYSTORE_B64 }}
+          KP: ${{ secrets.KEYSTORE_PASS }}
+        run: |
+          if [ -n "$KS" ]; then
+            P=$(printf '%s' "$KP" | tr -d '\r\n')
+            echo "::add-mask::$P"
+            printf '%s' "$KS" | tr -d '\r\n' | base64 -d > "$RUNNER_TEMP/kajypay.p12"
+            echo "KEYSTORE_FILE=$RUNNER_TEMP/kajypay.p12" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PASS=$P" >> "$GITHUB_ENV"
+            echo "Keystore stable active"
+          else
+            echo "Pas de keystore: signature debug"
+          fi
       - run: gradle assembleDebug --no-daemon
         working-directory: apps/gateway
       - uses: actions/upload-artifact@v4
         with:
-          name: kajypay-gateway-debug
+          name: kajypay-gateway
           path: apps/gateway/app/build/outputs/apk/debug/*.apk
