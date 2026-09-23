@@ -13,6 +13,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.provider.Settings;
 import android.text.InputFilter;
 import android.text.InputType;
@@ -44,7 +45,7 @@ public class MainActivity extends Activity {
     private int simChoisie = 1;
     private TextView etat, simLabel, montant, nombre, contact, info;
     private Button pauseBtn;
-    private LinearLayout liste, alerte;
+    private LinearLayout liste, alerte, batterie;
     private final List<LinearLayout> onglets = new ArrayList<>();
     private final List<Integer> slotsOnglets = new ArrayList<>();
     private final Runnable boucle = new Runnable() {
@@ -164,7 +165,7 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int code, String[] perms, int[] res) {
         super.onRequestPermissionsResult(code, perms, res);
         demarrerSiPossible();
-        if (accueilVisible) majAccueil();
+        if (accueilVisible) { majAccueil(); detecterSims(); }
     }
 
     void demarrerSiPossible() {
@@ -264,6 +265,19 @@ public class MainActivity extends Activity {
         c.addView(alerte, plein(16));
         autoriser.setOnClickListener(v -> demanderPermissions());
         reglages.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", getPackageName(), null))));
+        batterie = colonne();
+        batterie.setBackground(fond(Color.parseColor("#FFF4D6"), 16, 0, 0));
+        batterie.setPadding(dp(14), dp(12), dp(14), dp(12));
+        TextView bt = texte("L'économie de batterie peut couper KajyPay et faire manquer des paiements.", 14, WARN, true);
+        bt.setLineSpacing(0, 1.2f);
+        batterie.addView(bt);
+        Button bb = bouton("Désactiver l'économie de batterie", WARN, Color.WHITE, 0, 14);
+        batterie.addView(bb, plein(10));
+        c.addView(batterie, plein(12));
+        bb.setOnClickListener(v -> {
+            try { startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName()))); }
+            catch (Exception e) { startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)); }
+        });
 
         LinearLayout rangee = new LinearLayout(this);
         onglets.clear();
@@ -272,6 +286,7 @@ public class MainActivity extends Activity {
             JSONArray sims = new JSONArray(store.sims());
             for (int i = 0; i < sims.length(); i++) {
                 JSONObject s = sims.getJSONObject(i);
+                if (s.optInt("actif", 1) != 1) continue;
                 final int slot = s.optInt("slot", i + 1);
                 String op = s.optString("operateur");
                 LinearLayout o = new LinearLayout(this);
@@ -289,11 +304,12 @@ public class MainActivity extends Activity {
                 col.addView(texte(libelle(op) + (s.optInt("actif", 1) == 1 ? "" : " (arrêtée)"), 12, MUTED, false));
                 o.addView(col);
                 o.setOnClickListener(v -> { simChoisie = slot; majAccueil(); });
-                rangee.addView(o, poids(i == 0 ? 0 : 8));
+                rangee.addView(o, poids(onglets.isEmpty() ? 0 : 8));
                 onglets.add(o);
                 slotsOnglets.add(slot);
             }
         } catch (Exception ignore) { }
+        if (onglets.isEmpty()) rangee.addView(texte("Aucune SIM Mobile Money détectée. Vérifiez les cartes SIM et l'autorisation Téléphone.", 14, MUTED, false));
         if (!slotsOnglets.isEmpty() && !slotsOnglets.contains(simChoisie)) simChoisie = slotsOnglets.get(0);
         c.addView(rangee, plein(16));
 
@@ -359,6 +375,11 @@ public class MainActivity extends Activity {
         demanderPermissions();
         demarrerSiPossible();
         majAccueil();
+        detecterSims();
+    }
+
+    void detecterSims() {
+        new Thread(() -> { if (Sync.synchroniserSims(this)) runOnUiThread(() -> { if (accueilVisible) afficherAccueil(); }); }).start();
     }
 
     String statutLibelle(Journal.Ligne l) {
@@ -386,6 +407,8 @@ public class MainActivity extends Activity {
         if (!accueilVisible || etat == null) return;
         boolean autorise = smsAutorise();
         alerte.setVisibility(autorise ? View.GONE : View.VISIBLE);
+        PowerManager pm = getSystemService(PowerManager.class);
+        batterie.setVisibility(pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName()) ? View.VISIBLE : View.GONE);
         etat.setText(!autorise ? "●  Autorisation SMS manquante" : store.pause() ? "●  En pause" : KajyService.enMarche() ? "●  Service en marche" : "●  Service arrêté");
         pauseBtn.setText(store.pause() ? "Reprendre" : "Pause");
         String op = "";
