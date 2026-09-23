@@ -63,7 +63,7 @@ public class MainActivity extends Activity {
     private String histoQ = "";
     private ScrollView scroll;
     private LinearLayout contenu, liste, alerte, batterie, listeHisto;
-    private TextView etat, simLabel, montant, nombre, contact, batterieTxt, info, resumeHisto, erreurConnexion;
+    private TextView etat, simLabel, montant, nombre, contact, batterieTxt, soldeMontant, soldeMaj, info, resumeHisto, erreurConnexion;
     private Button pauseBtn, okConnexion;
     private final List<Button> navBoutons = new ArrayList<>();
     private final List<LinearLayout> onglets = new ArrayList<>();
@@ -338,6 +338,75 @@ public class MainActivity extends Activity {
         return "";
     }
 
+    void lancerSolde(int slot, Runnable finUi) {
+        JSONArray a = sims();
+        String code = null;
+        for (int i = 0; i < a.length(); i++) {
+            JSONObject o = a.optJSONObject(i);
+            if (o != null && o.optInt("slot") == slot) code = o.optString("code_ussd_solde", "");
+        }
+        if (code == null || code.trim().isEmpty()) {
+            Toast.makeText(this, "Aucun code USSD configuré pour la SIM " + slot + ". Réglages > Cartes SIM.", Toast.LENGTH_LONG).show();
+            if (finUi != null) finUi.run();
+            return;
+        }
+        if (!UssdReader.estVivant(this)) {
+            demanderAccessibilite();
+            if (finUi != null) finUi.run();
+            return;
+        }
+        final int fslot = slot;
+        SoldeUssd.consulter(this, slot, code, (ok, montant, texte) -> {
+            if (ok) new Thread(() -> Sync.envoyerSolde(this, fslot, montant, texte)).start();
+            runOnUiThread(() -> {
+                Toast.makeText(this, ok ? ("Solde SIM " + fslot + " : " + (montant != null ? ar(montant) + " Ar" : "lu")) : ("Lecture impossible : " + texte), Toast.LENGTH_LONG).show();
+                if (finUi != null) finUi.run();
+            });
+        });
+    }
+
+    void dialogueCodeUssd(int slot, String actuel) {
+        final EditText e = new EditText(this);
+        e.setText(actuel);
+        e.setHint("#144*5*3#  (séparez par | si plusieurs étapes)");
+        e.setTextColor(TEXT);
+        e.setPadding(dp(16), dp(12), dp(16), dp(12));
+        new AlertDialog.Builder(this)
+            .setTitle("Code USSD solde — SIM " + slot)
+            .setMessage("Code de consultation du solde Mobile Money de cette SIM. Pour un menu à plusieurs étapes, séparez les réponses par « | » (ex. *436#|6|2).")
+            .setView(e)
+            .setNegativeButton("Annuler", null)
+            .setPositiveButton("Enregistrer", (d, w) -> {
+                String code = e.getText().toString().trim();
+                new Thread(() -> {
+                    boolean ok = false;
+                    try {
+                        org.json.JSONObject r = new org.json.JSONObject(Api.post(store.api() + "/gateway/mon-ussd", new org.json.JSONObject().put("slot", slot).put("code_ussd_solde", code).toString(), "Appareil " + store.jeton()));
+                        ok = r.optBoolean("ok");
+                    } catch (Exception ex) { }
+                    final boolean f = ok;
+                    runOnUiThread(() -> {
+                        Toast.makeText(this, f ? "Code enregistré" : "Échec de l'enregistrement", Toast.LENGTH_SHORT).show();
+                        if (f) { store.setSimsEnvoyees(""); new Thread(() -> { Sync.synchroniserSims(this); runOnUiThread(() -> montrer(REGLAGES)); }).start(); }
+                    });
+                }).start();
+            })
+            .show();
+    }
+
+
+    void demanderAccessibilite() {
+        new AlertDialog.Builder(this)
+            .setTitle("Activer la lecture du solde")
+            .setMessage("Pour lire le solde Mobile Money, activez « KajyPay solde » dans Accessibilité. KajyPay lit alors uniquement l'écran des menus USSD, jamais vos autres applications.")
+            .setNegativeButton("Plus tard", null)
+            .setPositiveButton("Ouvrir les réglages", (d, w) -> {
+                try { startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)); }
+                catch (Exception e) { Toast.makeText(this, "Ouvrez Réglages > Accessibilité", Toast.LENGTH_LONG).show(); }
+            })
+            .show();
+    }
+
     String texteContact() {
         long dc = store.dernierContact();
         long min = dc == 0 ? -1 : (System.currentTimeMillis() - dc) / 60000;
@@ -589,6 +658,29 @@ public class MainActivity extends Activity {
         hero.addView(batterieTxt, plein(2));
         contenu.addView(hero, plein(14));
 
+        LinearLayout soldeCarte = colonne();
+        soldeCarte.setBackground(fond(CARD, 18, LINE, 1));
+        soldeCarte.setPadding(dp(16), dp(14), dp(16), dp(14));
+        LinearLayout soldeHaut = new LinearLayout(this);
+        soldeHaut.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout soldeG = colonne();
+        soldeG.addView(texte("Solde Mobile Money", 13, MUTED, false));
+        soldeMontant = texte("—", 24, TEXT, true);
+        soldeG.addView(soldeMontant);
+        soldeMaj = texte("", 12, MUTED, false);
+        soldeG.addView(soldeMaj);
+        soldeHaut.addView(soldeG, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        Button verifierSolde = bouton("Vérifier", ACCENT, Color.WHITE, 0, 14);
+        verifierSolde.setPadding(dp(18), 0, dp(18), 0);
+        soldeHaut.addView(verifierSolde);
+        soldeCarte.addView(soldeHaut);
+        contenu.addView(soldeCarte, plein(12));
+        verifierSolde.setOnClickListener(v -> {
+            verifierSolde.setEnabled(false);
+            verifierSolde.setText("…");
+            lancerSolde(simChoisie, () -> { verifierSolde.setEnabled(true); verifierSolde.setText("Vérifier"); majAccueil(); });
+        });
+
         LinearLayout actions = new LinearLayout(this);
         pauseBtn = bouton("Pause", CARD, ACCENT, LINE, 13);
         Button synchro = bouton("Synchro", CARD, ACCENT, LINE, 13);
@@ -655,6 +747,21 @@ public class MainActivity extends Activity {
         nombre.setText(j[0] + (j[0] > 1 ? " paiements confirmés" : " paiement confirmé") + (att > 0 ? ", " + att + " en attente d'envoi" : ""));
         contact.setText(texteContact());
         if (batterieTxt != null) batterieTxt.setText(texteBatterie());
+        if (soldeMontant != null) {
+            JSONArray sa = sims();
+            Long m = null; long maj = 0; String code = "";
+            for (int i = 0; i < sa.length(); i++) {
+                JSONObject o = sa.optJSONObject(i);
+                if (o != null && o.optInt("slot") == simChoisie) {
+                    code = o.optString("code_ussd_solde", "");
+                    if (o.has("solde_operateur_ar") && !o.isNull("solde_operateur_ar")) m = o.optLong("solde_operateur_ar");
+                    maj = o.optLong("solde_maj", 0);
+                }
+            }
+            soldeMontant.setText(m != null ? ar(m) + " Ar" : (code.isEmpty() ? "Non configuré" : "—"));
+            if (maj > 0) { long min = (System.currentTimeMillis() - maj) / 60000; soldeMaj.setText(min <= 0 ? "à l'instant" : "il y a " + min + " min"); }
+            else soldeMaj.setText(code.isEmpty() ? "Ajoutez le code USSD dans Réglages" : "Jamais vérifié");
+        }
         liste.removeAllViews();
         List<Journal.Ligne> ls = journal.rechercher(simChoisie, 0, null, true, 5);
         if (ls.isEmpty()) { liste.addView(texte("Aucun paiement reçu sur la SIM " + simChoisie + " pour le moment.", 14, MUTED, false), plein(6)); return; }
@@ -851,8 +958,13 @@ public class MainActivity extends Activity {
         for (int i = 0; i < a.length(); i++) {
             JSONObject o = a.optJSONObject(i);
             if (o == null) continue;
-            cartes.add(ligne("SIM " + o.optInt("slot"), libelle(o.optString("operateur")), o.optInt("actif", 1) == 1 ? "Détectée" : "Absente", null));
+            final int slot = o.optInt("slot");
+            final String code = o.optString("code_ussd_solde", "");
+            cartes.add(ligne("SIM " + slot, libelle(o.optString("operateur")), o.optInt("actif", 1) == 1 ? "Détectée" : "Absente", null));
+            cartes.add(ligne("Code USSD solde SIM " + slot, code.isEmpty() ? "Non configuré (ex. #144*5*3#)" : code, "Modifier", v -> dialogueCodeUssd(slot, code)));
         }
+        cartes.add(ligne("Lecture du solde", UssdReader.estVivant(this) ? "Accessibilité activée" : "Accessibilité désactivée", UssdReader.estVivant(this) ? "OK" : "Activer", v -> demanderAccessibilite()));
+        cartes.add(ligneSwitch("Vérifier le solde après chaque paiement", "Lit le solde peu après un paiement reçu", store.soldeAuto(), (b, on) -> store.setSoldeAuto(on)));
         cartes.add(ligne("Actualiser les SIM", "Relire les cartes SIM du téléphone", "", v -> {
             store.setSimsEnvoyees("");
             Toast.makeText(this, "Lecture des cartes SIM…", Toast.LENGTH_SHORT).show();

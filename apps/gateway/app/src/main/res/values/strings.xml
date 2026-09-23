@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">KajyPay</string>
+    <string name="ussd_desc">Lit uniquement l\'écran des menus USSD Mobile Money pour relever le solde de vos SIM. Aucune autre application n\'est observée.</string>
+</resources>

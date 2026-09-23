@@ -23,5 +23,7 @@ public final class Store {
     public String simsEnvoyees() { return p.getString("sims_env", ""); }
     public void setSimsEnvoyees(String v) { p.edit().putString("sims_env", v).apply(); }
     public void setAuto(boolean v) { p.edit().putBoolean("auto", v).apply(); }
+    public boolean soldeAuto() { return p.getBoolean("solde_auto", true); }
+    public void setSoldeAuto(boolean v) { p.edit().putBoolean("solde_auto", v).apply(); }
     public void effacer() { p.edit().clear().apply(); }
 }

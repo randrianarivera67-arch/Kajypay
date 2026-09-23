@@ -56,6 +56,20 @@ public final class Sync {
         }
     }
 
+    public static synchronized boolean envoyerSolde(Context c, int slot, Long montantAr, String texte) {
+        Store s = new Store(c);
+        if (!s.estAppaire()) return false;
+        try {
+            JSONObject o = new JSONObject().put("slot", slot);
+            if (montantAr != null) o.put("montant_ar", montantAr);
+            if (texte != null) o.put("texte", texte.length() > 300 ? texte.substring(0, 300) : texte);
+            JSONObject r = new JSONObject(Api.post(s.api() + "/gateway/solde", o.toString(), "Appareil " + s.jeton()));
+            return r.optBoolean("ok");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     public static synchronized String ping(Context c) {
         Store s = new Store(c);
         if (!s.estAppaire()) return "Appareil non connecté";

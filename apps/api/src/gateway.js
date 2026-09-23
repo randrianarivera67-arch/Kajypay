@@ -63,6 +63,13 @@ export async function gererGateway(request, env, url) {
     await dbTx(env, stmts);
     return json({ ok: true, sims: await lignes(env, app.id) });
   }
+  if (p === "/gateway/mon-ussd") {
+    const { slot, code_ussd_solde } = await lireCorps(request);
+    if (![1, 2].includes(slot)) return json({ ok: false, erreur: "slot invalide" }, 400);
+    const code = typeof code_ussd_solde === "string" ? code_ussd_solde.trim().slice(0, 60) : "";
+    await db(env, [{ sql: "UPDATE lignes_sim SET code_ussd_solde = ? WHERE appareil_id = ? AND slot = ?", args: [code || null, app.id, slot] }]);
+    return json({ ok: true });
+  }
   if (p === "/gateway/solde") {
     const { slot, montant_ar, texte } = await lireCorps(request);
     if (![1, 2].includes(slot)) return json({ ok: false, erreur: "slot invalide" }, 400);
