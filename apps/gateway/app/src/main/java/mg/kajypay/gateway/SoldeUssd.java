@@ -167,20 +167,47 @@ public final class SoldeUssd {
     @SuppressLint("MissingPermission")
     private static boolean composer(Context context, String code, int subId) {
         android.net.Uri uri = android.net.Uri.parse("tel:" + android.net.Uri.encode(code));
+        android.telecom.TelecomManager tcm = (android.telecom.TelecomManager) context.getSystemService(Context.TELECOM_SERVICE);
+
+        // 1) Intention d'appel vers le dialer par défaut (le plus fiable sur les ROM constructeurs)
         try {
             android.content.Intent i = new android.content.Intent(android.content.Intent.ACTION_CALL, uri);
             i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
-            android.telecom.TelecomManager tcm = (android.telecom.TelecomManager) context.getSystemService(Context.TELECOM_SERVICE);
             String dialer = tcm != null ? tcm.getDefaultDialerPackage() : null;
-            if (dialer != null) i.setPackage(dialer);
+            if (dialer != null && !dialer.isEmpty()) i.setPackage(dialer);
             android.telecom.PhoneAccountHandle h = compte(context, tcm, subId);
             if (h != null) i.putExtra(android.telecom.TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, h);
             int slot = slotDe(context, subId);
-            if (slot >= 0) { i.putExtra("com.android.phone.extra.slot", slot); i.putExtra("simSlot", slot); i.putExtra("slot", slot); }
+            if (slot >= 0) { i.putExtra("com.android.phone.extra.slot", slot); i.putExtra("simSlot", slot); i.putExtra("slot", slot); i.putExtra("simId", slot); }
             i.putExtra("subscription", subId);
+            i.putExtra("android.telephony.extra.SUBSCRIPTION_INDEX", subId);
             context.startActivity(i);
+            Log.d(TAG, "composé par intention, dialer=" + dialer);
             return true;
-        } catch (Exception e) { Log.e(TAG, "composer: " + e.getMessage()); return false; }
+        } catch (Exception e) { Log.e(TAG, "intention: " + e.getMessage()); }
+
+        // 2) Secours : placeCall() avec le compte de la SIM visée
+        if (tcm != null) {
+            try {
+                android.os.Bundle extras = new android.os.Bundle();
+                android.telecom.PhoneAccountHandle h = compte(context, tcm, subId);
+                if (h != null) extras.putParcelable(android.telecom.TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, h);
+                tcm.placeCall(uri, extras);
+                Log.d(TAG, "composé par placeCall");
+                return true;
+            } catch (Exception e) { Log.e(TAG, "placeCall: " + e.getMessage()); }
+        }
+
+        // 3) Dernier recours : intention d'appel sans package
+        try {
+            android.content.Intent i = new android.content.Intent(android.content.Intent.ACTION_CALL, uri);
+            i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            android.telecom.PhoneAccountHandle h = compte(context, tcm, subId);
+            if (h != null) i.putExtra(android.telecom.TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, h);
+            context.startActivity(i);
+            Log.d(TAG, "composé par intention sans package");
+            return true;
+        } catch (Exception e) { Log.e(TAG, "intention nue: " + e.getMessage()); return false; }
     }
 
     @SuppressLint("MissingPermission")
