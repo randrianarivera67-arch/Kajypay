@@ -242,6 +242,60 @@ public class MainActivity extends Activity {
         return t;
     }
 
+    View pastilleIcone(int res, int taille, int couleurFond) {
+        ImageView v = new ImageView(this);
+        v.setImageResource(res);
+        int p = dp(taille / 4);
+        v.setPadding(p, p, p, p);
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.OVAL);
+        g.setColor(couleurFond);
+        v.setBackground(g);
+        v.setLayoutParams(new LinearLayout.LayoutParams(dp(taille), dp(taille)));
+        return v;
+    }
+
+    LinearLayout ligneIcone(int res, View contenuVue, int tailleIcone, int fondIcone) {
+        LinearLayout l = new LinearLayout(this);
+        l.setGravity(Gravity.CENTER_VERTICAL);
+        l.addView(pastilleIcone(res, tailleIcone, fondIcone));
+        LinearLayout w = colonne();
+        w.setPadding(dp(12), 0, 0, 0);
+        w.addView(contenuVue);
+        l.addView(w, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        return l;
+    }
+
+    Button boutonIcone(String label, int icone) {
+        Button b = new Button(this);
+        b.setText(label);
+        b.setAllCaps(false);
+        b.setTextSize(13);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setTextColor(TEXT);
+        b.setBackground(fond(CARD, 18, LINE, 1));
+        b.setMinHeight(dp(92));
+        b.setStateListAnimator(null);
+        b.setPadding(0, dp(10), 0, dp(10));
+        android.graphics.drawable.Drawable d = getDrawable(icone);
+        if (d != null) {
+            int sz = dp(40);
+            android.graphics.Bitmap bm = android.graphics.Bitmap.createBitmap(sz, sz, android.graphics.Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas cv = new android.graphics.Canvas(bm);
+            android.graphics.Paint pt = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+            pt.setColor(ACCENT);
+            cv.drawCircle(sz / 2f, sz / 2f, sz / 2f, pt);
+            int m = dp(9);
+            d.setBounds(m, m, sz - m, sz - m);
+            d.draw(cv);
+            android.graphics.drawable.BitmapDrawable bd = new android.graphics.drawable.BitmapDrawable(getResources(), bm);
+            bd.setBounds(0, 0, sz, sz);
+            b.setCompoundDrawables(null, bd, null, null);
+            b.setCompoundDrawablePadding(dp(6));
+        }
+        return b;
+    }
+
     String texteBatterie() {
         try {
             BatteryManager bm = getSystemService(BatteryManager.class);
@@ -642,45 +696,81 @@ public class MainActivity extends Activity {
         if (!slotsOnglets.isEmpty() && !slotsOnglets.contains(simChoisie)) simChoisie = slotsOnglets.get(0);
         contenu.addView(rangee, plein(16));
 
-        LinearLayout hero = colonne();
-        GradientDrawable heroFond = new GradientDrawable();
-        heroFond.setColor(ACCENT);
+        LinearLayout hero = new LinearLayout(this);
+        GradientDrawable heroFond = new GradientDrawable(GradientDrawable.Orientation.TL_BR, new int[]{Color.parseColor("#0F7A50"), Color.parseColor("#0B5638")});
         heroFond.setCornerRadius(dp(22));
-        heroFond.setStroke(dp(3), Color.parseColor("#F2C14E"));
+        heroFond.setStroke(dp(3), Color.parseColor("#E8B94A"));
         hero.setBackground(heroFond);
-        hero.setPadding(dp(20), dp(18), dp(20), dp(20));
-        etat = texte("", 14, Color.WHITE, true);
-        hero.addView(etat);
-        simLabel = texte("", 12, Color.parseColor("#CFE9DC"), true);
-        hero.addView(simLabel, plein(4));
-        hero.addView(texte("Reçu aujourd'hui", 13, Color.parseColor("#CFE9DC"), false), plein(14));
-        montant = texte("", 36, Color.WHITE, true);
-        hero.addView(montant);
-        nombre = texte("", 13, Color.parseColor("#CFE9DC"), false);
-        hero.addView(nombre);
-        contact = texte("", 12, Color.parseColor("#CFE9DC"), false);
-        hero.addView(contact, plein(8));
-        batterieTxt = texte("", 12, Color.parseColor("#CFE9DC"), false);
-        hero.addView(batterieTxt, plein(2));
-        contenu.addView(hero, plein(14));
+        hero.setPadding(dp(16), dp(16), dp(16), dp(16));
+        int clair = Color.parseColor("#BFE3CF"), pastille = Color.parseColor("#1E8A5E");
 
-        LinearLayout soldeCarte = colonne();
-        soldeCarte.setBackground(fond(CARD, 18, LINE, 1));
-        soldeCarte.setPadding(dp(16), dp(14), dp(16), dp(14));
-        LinearLayout soldeHaut = new LinearLayout(this);
-        soldeHaut.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout soldeG = colonne();
-        soldeG.addView(texte("Solde Mobile Money", 13, MUTED, false));
-        soldeMontant = texte("—", 24, TEXT, true);
-        soldeG.addView(soldeMontant);
-        soldeMaj = texte("", 12, MUTED, false);
-        soldeG.addView(soldeMaj);
-        soldeHaut.addView(soldeG, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
-        Button verifierSolde = bouton("Vérifier", ACCENT, Color.WHITE, 0, 14);
-        verifierSolde.setPadding(dp(18), 0, dp(18), 0);
-        soldeHaut.addView(verifierSolde);
-        soldeCarte.addView(soldeHaut);
-        contenu.addView(soldeCarte, plein(12));
+        LinearLayout gaucheH = colonne();
+        LinearLayout blocEtat = colonne();
+        etat = texte("", 15, Color.WHITE, true);
+        blocEtat.addView(etat);
+        simLabel = texte("", 12, clair, true);
+        blocEtat.addView(simLabel);
+        gaucheH.addView(ligneIcone(R.drawable.ic_signal, blocEtat, 34, pastille));
+
+        LinearLayout blocRecu = colonne();
+        blocRecu.addView(texte("Reçu aujourd'hui", 13, clair, false));
+        montant = texte("", 32, Color.WHITE, true);
+        blocRecu.addView(montant);
+        nombre = texte("", 12, clair, false);
+        blocRecu.addView(nombre);
+        gaucheH.addView(ligneIcone(R.drawable.ic_down, blocRecu, 40, pastille), plein(16));
+
+        View sepH = new View(this);
+        sepH.setBackgroundColor(Color.parseColor("#3FA57C"));
+        gaucheH.addView(sepH, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)) {{ topMargin = dp(14); }});
+
+        LinearLayout blocContact = colonne();
+        contact = texte("", 12, clair, false);
+        blocContact.addView(contact);
+        gaucheH.addView(ligneIcone(R.drawable.ic_clock, blocContact, 26, pastille), plein(12));
+        LinearLayout blocBat = colonne();
+        batterieTxt = texte("", 12, clair, false);
+        blocBat.addView(batterieTxt);
+        gaucheH.addView(ligneIcone(R.drawable.ic_battery, blocBat, 26, pastille), plein(8));
+
+        LinearLayout.LayoutParams lpG = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 55);
+        hero.addView(gaucheH, lpG);
+
+        View sepV = new View(this);
+        sepV.setBackgroundColor(Color.parseColor("#3FA57C"));
+        LinearLayout.LayoutParams lpS = new LinearLayout.LayoutParams(dp(1), LinearLayout.LayoutParams.MATCH_PARENT);
+        lpS.leftMargin = dp(12); lpS.rightMargin = dp(12);
+        hero.addView(sepV, lpS);
+
+        LinearLayout droiteH = colonne();
+        droiteH.setGravity(Gravity.CENTER_HORIZONTAL);
+        droiteH.addView(pastilleIcone(R.drawable.ic_shield, 52, pastille));
+        TextView titreSolde = texte("Solde Mobile Money", 14, Color.WHITE, true);
+        titreSolde.setGravity(Gravity.CENTER);
+        droiteH.addView(titreSolde, plein(10));
+        soldeMontant = texte("—", 26, Color.WHITE, true);
+        soldeMontant.setGravity(Gravity.CENTER);
+        droiteH.addView(soldeMontant, plein(4));
+        soldeMaj = texte("", 12, clair, false);
+        soldeMaj.setGravity(Gravity.CENTER);
+        droiteH.addView(soldeMaj);
+        Button verifierSolde = new Button(this);
+        verifierSolde.setText("Vérifier");
+        verifierSolde.setAllCaps(false);
+        verifierSolde.setTextSize(15);
+        verifierSolde.setTypeface(Typeface.DEFAULT_BOLD);
+        verifierSolde.setTextColor(Color.WHITE);
+        GradientDrawable fv = new GradientDrawable();
+        fv.setColor(Color.parseColor("#126B49"));
+        fv.setCornerRadius(dp(16));
+        fv.setStroke(dp(2), Color.parseColor("#E8B94A"));
+        verifierSolde.setBackground(fv);
+        verifierSolde.setMinHeight(dp(48));
+        verifierSolde.setStateListAnimator(null);
+        droiteH.addView(verifierSolde, plein(14));
+        LinearLayout.LayoutParams lpD = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 45);
+        hero.addView(droiteH, lpD);
+        contenu.addView(hero, plein(14));
         verifierSolde.setOnClickListener(v -> {
             verifierSolde.setEnabled(false);
             verifierSolde.setText("…");
@@ -688,10 +778,10 @@ public class MainActivity extends Activity {
         });
 
         LinearLayout actions = new LinearLayout(this);
-        pauseBtn = bouton("Pause", CARD, ACCENT, LINE, 13);
-        Button synchro = bouton("Synchro", CARD, ACCENT, LINE, 13);
-        Button tester = bouton("Tester", CARD, ACCENT, LINE, 13);
-        Button jrn = bouton("Journal", CARD, ACCENT, LINE, 13);
+        pauseBtn = boutonIcone("Pause", store.pause() ? R.drawable.ic_play : R.drawable.ic_pause);
+        Button synchro = boutonIcone("Synchro", R.drawable.ic_sync);
+        Button tester = boutonIcone("Tester", R.drawable.ic_test);
+        Button jrn = boutonIcone("Journal", R.drawable.ic_doc);
         actions.addView(pauseBtn, poids(0));
         actions.addView(synchro, poids(6));
         actions.addView(tester, poids(6));
