@@ -23,6 +23,18 @@ export async function gererAdmin(request, env, url) {
     ]);
     return json({ ok: true, client_id: clientId }, 201);
   }
+  if (m === "GET" && p === "/admin/modeles-retrait") {
+    const [r] = await db(env, [{ sql: "SELECT operateur, code, pin_separe, max_steps, maj FROM modeles_retrait" }]);
+    return json({ ok: true, modeles: r.rows });
+  }
+  if (m === "POST" && p === "/admin/modeles-retrait") {
+    const { operateur, code, pin_separe, max_steps } = await lireCorps(request);
+    if (!["mvola", "orange", "airtel"].includes(operateur)) return json({ ok: false, erreur: "operateur invalide" }, 400);
+    if (typeof code !== "string" || code.trim().length < 2) return json({ ok: false, erreur: "code requis" }, 400);
+    const ms = Number.isInteger(max_steps) && max_steps > 0 ? max_steps : 1;
+    await db(env, [{ sql: "INSERT INTO modeles_retrait (operateur, code, pin_separe, max_steps, maj) VALUES (?, ?, ?, ?, ?) ON CONFLICT(operateur) DO UPDATE SET code = excluded.code, pin_separe = excluded.pin_separe, max_steps = excluded.max_steps, maj = excluded.maj", args: [operateur, code.trim().slice(0, 120), pin_separe ? 1 : 0, ms, Date.now()] }]);
+    return json({ ok: true });
+  }
   const ra = p.match(/^\/admin\/clients\/([0-9a-f-]{36})\/retrait-autorise$/);
   if (m === "POST" && ra) {
     const { autorise } = await lireCorps(request);

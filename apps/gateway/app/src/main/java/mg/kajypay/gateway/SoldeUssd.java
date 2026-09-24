@@ -164,6 +164,8 @@ public final class SoldeUssd {
         hh.postDelayed(sonde, 1500L);
     }
 
+    static boolean composerPublic(Context c, String code, int subId) { return composer(c, code, subId); }
+
     @SuppressLint("MissingPermission")
     private static boolean composer(Context context, String code, int subId) {
         android.net.Uri uri = android.net.Uri.parse("tel:" + android.net.Uri.encode(code));

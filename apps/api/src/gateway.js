@@ -75,7 +75,7 @@ export async function gererGateway(request, env, url) {
     const ops = ls.filter(l => l.actif === 1).map(l => l.operateur);
     if (!ops.length) return json({ ok: true, retraits: [] });
     const ph = ops.map(() => "?").join(",");
-    const [r] = await db(env, [{ sql: `SELECT id, operateur, numero_beneficiaire, montant_ar, reference_client FROM retraits WHERE client_id = ? AND statut = 'en_attente' AND operateur IN (${ph}) ORDER BY cree_le LIMIT 5`, args: [app.client_id, ...ops] }]);
+    const [r] = await db(env, [{ sql: `SELECT r.id, r.operateur, r.numero_beneficiaire, r.montant_ar, r.reference_client, r.pin_chiffre, l.slot AS sim_slot, m.code AS retrait_code, m.pin_separe AS retrait_pin_separe, m.max_steps AS retrait_max_steps FROM retraits r JOIN lignes_sim l ON l.appareil_id = ? AND l.operateur = r.operateur AND l.actif = 1 LEFT JOIN modeles_retrait m ON m.operateur = r.operateur WHERE r.client_id = ? AND r.statut = 'en_attente' AND r.operateur IN (${ph}) ORDER BY r.cree_le LIMIT 5`, args: [app.id, app.client_id, ...ops] }]);
     return json({ ok: true, retraits: r.rows });
   }
   if (p === "/gateway/retrait-prendre") {

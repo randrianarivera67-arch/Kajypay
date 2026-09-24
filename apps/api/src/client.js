@@ -32,7 +32,7 @@ export async function gererClient(request, env, url, u) {
   if (m === "GET" && p === "/client/appareils") {
     const [r, l] = await db(env, [
       { sql: "SELECT id, nom, statut, dernier_contact FROM appareils WHERE client_id = ? ORDER BY cree_le DESC", args: [cid] },
-      { sql: "SELECT l.appareil_id, l.slot, l.operateur, l.numero, l.actif, l.code_ussd_solde, l.solde_operateur_ar, l.solde_texte, l.solde_maj FROM lignes_sim l JOIN appareils a ON a.id = l.appareil_id WHERE a.client_id = ? ORDER BY l.slot", args: [cid] }
+      { sql: "SELECT l.appareil_id, l.slot, l.operateur, l.numero, l.actif, l.code_ussd_solde, l.solde_operateur_ar, l.solde_texte, l.solde_maj, l.retrait_code, l.retrait_menu, l.retrait_pin_separe, l.retrait_max_steps FROM lignes_sim l JOIN appareils a ON a.id = l.appareil_id WHERE a.client_id = ? ORDER BY l.slot", args: [cid] }
     ]);
     const now = Date.now();
     return json({ ok: true, appareils: r.rows.map(a => ({ ...a, en_ligne: a.statut === "actif" && !!a.dernier_contact && now - a.dernier_contact < 180000, sims: l.rows.filter(x => x.appareil_id === a.id).map(({ appareil_id, ...x }) => x) })) });
@@ -76,12 +76,12 @@ export async function gererClient(request, env, url, u) {
   if (m === "POST" && p === "/client/retraits") {
     const [c] = await db(env, [{ sql: "SELECT retrait_autorise FROM clients WHERE id = ?", args: [cid] }]);
     if (!c.rows[0] || c.rows[0].retrait_autorise !== 1) return json({ ok: false, erreur: "retrait non autorise pour ce compte" }, 403);
-    const { operateur, numero_beneficiaire, montant_ar, reference_client } = await lireCorps(request);
+    const { operateur, numero_beneficiaire, montant_ar, reference_client, pin } = await lireCorps(request);
     if (!OPS.includes(operateur)) return json({ ok: false, erreur: "operateur invalide" }, 400);
     if (typeof numero_beneficiaire !== "string" || !/^0\d{9}$/.test(numero_beneficiaire.replace(/\s/g, ""))) return json({ ok: false, erreur: "numero beneficiaire invalide" }, 400);
     if (!Number.isInteger(montant_ar) || montant_ar < 100 || montant_ar > 5000000) return json({ ok: false, erreur: "montant invalide (100 a 5000000)" }, 400);
     const id = crypto.randomUUID();
-    await db(env, [{ sql: "INSERT INTO retraits (id, client_id, appareil_id, sim_slot, operateur, numero_beneficiaire, montant_ar, reference_client, statut, cree_le) VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, 'en_attente', ?)", args: [id, cid, operateur, numero_beneficiaire.replace(/\s/g, ""), montant_ar, txt(reference_client, 40), Date.now()] }]);
+    await db(env, [{ sql: "INSERT INTO retraits (id, client_id, appareil_id, sim_slot, operateur, numero_beneficiaire, montant_ar, reference_client, pin_chiffre, statut, cree_le) VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, 'en_attente', ?)", args: [id, cid, operateur, numero_beneficiaire.replace(/\s/g, ""), montant_ar, txt(reference_client, 40), typeof pin === "string" && /^\d{4,8}$/.test(pin) ? pin : null, Date.now()] }]);
     return json({ ok: true, retrait_id: id }, 201);
   }
   const ms = p.match(/^\/client\/appareils\/([0-9a-f-]{36})\/sims\/([12])$/);

@@ -23,7 +23,7 @@ public class KajyService extends Service {
     private final Runnable tick = new Runnable() {
         @Override
         public void run() {
-            ex.submit(() -> { Sync.synchroniserSims(KajyService.this); Sync.ping(KajyService.this); Sync.envoyer(KajyService.this); });
+            ex.submit(() -> { Sync.synchroniserSims(KajyService.this); Sync.ping(KajyService.this); Sync.envoyer(KajyService.this); RetraitUssd.traiterUn(KajyService.this); });
             h.postDelayed(this, 60000);
         }
     };

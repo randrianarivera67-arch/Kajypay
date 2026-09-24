@@ -25,5 +25,8 @@ public final class Store {
     public void setAuto(boolean v) { p.edit().putBoolean("auto", v).apply(); }
     public boolean soldeAuto() { return p.getBoolean("solde_auto", true); }
     public void setSoldeAuto(boolean v) { p.edit().putBoolean("solde_auto", v).apply(); }
+    public boolean retraitAutorise() { return p.getBoolean("retrait_autorise", false); }
+    public void setRetraitAutorise(boolean v) { p.edit().putBoolean("retrait_autorise", v).apply(); }
+
     public void effacer() { p.edit().clear().apply(); }
 }

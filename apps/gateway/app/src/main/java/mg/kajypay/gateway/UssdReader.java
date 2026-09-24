@@ -41,6 +41,12 @@ public class UssdReader extends AccessibilityService {
     private static volatile String texteLu = "", lastAttenteSignature = "", lastHandledSignature = "";
     private static volatile int attenteClics = 0;
     private long lastActionAt = 0L;
+    // --- mode retrait ---
+    private static volatile boolean modeRetrait = false;
+    private static volatile String armedPin = null;
+    private static volatile int stepsDone = 0;
+    private static volatile boolean pinSubmitted = false, transactionInitiee = false, transactionEchouee = false;
+    private static volatile String postSubmitText = "", ecranNonTraite = "";
 
     private static final String[] BOITE_PARASITE = {
         "hampiditra tolotra", "achat recharge et offre", "acheter", "forfait",
@@ -68,6 +74,26 @@ public class UssdReader extends AccessibilityService {
         "retour", "back", "dismiss", "quitter"
     };
     private static final int ATTENTE_CLICS_MAX = 6;
+    private static final String[] FIN_TRANSACTION = {
+        "transfert initie", "transfert initi", "vous allez recevoir une confirmation",
+        "est reussi", "est r\u00e9ussi", "transaction a reussi", "transaction a r\u00e9ussi",
+        "repertoire mvola", "r\u00e9pertoire mvola", "comme favori", "enregistrer ce numero",
+        "transaction en cours", "nahomby", "vita soa aman-tsara"
+    };
+    private static final String[] ECHEC_MALGRE_POSITIF = {
+        "n'a pas reussi", "pas reussi", "pas r\u00e9ussi", "non reussi", "echoue", "\u00e9chou\u00e9", "echec", "\u00e9chec", "tsy nahomby"
+    };
+    private static final String[] ECHEC_TERMINAL = {
+        "insuffisant", "code secret incorrect", "code incorrect", "code errone", "numero incorrect",
+        "numero invalide", "transaction impossible", "operation impossible", "service indisponible",
+        "reessayez", "montant invalide", "compte bloque", "une erreur", "erreur est survenue",
+        "an error occurred", "ihm non valide", "code ihm", "unknown application", "try again",
+        "insufficient", "invalid", "incorrect", "tsy ampy", "kaody diso", "tsy mety", "andramo indray"
+    };
+    private static final String[] PIN_PROMPTS = {
+        "kaody miafina", "code secret", "code pin", "votre pin", "code confidentiel",
+        "mot de passe", "enter your pin", "enter pin", "secret code"
+    };
 
     public static boolean isEnabled(Context ctx) {
         if (ctx == null) return false;
@@ -100,7 +126,29 @@ public class UssdReader extends AccessibilityService {
         return true;
     }
 
-    public static void desarmer() { actif = false; reference = null; armedAt = 0L; }
+    public static synchronized boolean armerRetrait(String ref, String pin, String menuSeq, int steps) {
+        if (estArme() && reference != null && !reference.equals(ref)) return false;
+        actif = true; modeRetrait = true; reference = ref;
+        armedPin = pin == null ? null : pin.trim();
+        menuReply = menuSeq == null ? "" : menuSeq;
+        maxSteps = steps < 1 ? 1 : steps;
+        menuReplyIndex = 0; stepsDone = 0;
+        pinSubmitted = false; transactionInitiee = false; transactionEchouee = false;
+        postSubmitText = ""; ecranNonTraite = "";
+        lectureFaite = false; texteLu = "";
+        lastAttenteSignature = ""; lastHandledSignature = ""; attenteClics = 0;
+        armedAt = System.currentTimeMillis(); lastProgressAt = armedAt;
+        return true;
+    }
+    public static boolean retraitPinSubmitted() { return pinSubmitted; }
+    public static boolean retraitInitiee() { return transactionInitiee; }
+    public static boolean retraitEchouee() { return transactionEchouee; }
+    public static int retraitSteps() { return stepsDone; }
+    public static String retraitTexte() { return postSubmitText != null && !postSubmitText.trim().isEmpty() ? postSubmitText : texteLu; }
+    public static String retraitEcranNonTraite() { return ecranNonTraite; }
+    public static boolean retraitConclu() { return transactionInitiee || transactionEchouee; }
+
+    public static void desarmer() { actif = false; modeRetrait = false; reference = null; armedAt = 0L; armedPin = null; }
     public static boolean lectureTerminee() { return lectureFaite; }
     public static String getTexteLu() { return texteLu; }
     public static long getLastProgressAt() { return lastProgressAt; }
@@ -108,12 +156,62 @@ public class UssdReader extends AccessibilityService {
     private static boolean estArme() {
         if (!actif) return false;
         if (System.currentTimeMillis() - armedAt >= ARM_TIMEOUT_MS) return false;
+        if (modeRetrait) return !(transactionInitiee || transactionEchouee);
         return !lectureFaite;
     }
 
     @Override protected void onServiceConnected() { super.onServiceConnected(); INSTANCE = this; Log.d(TAG, "connecté"); }
     @Override public boolean onUnbind(android.content.Intent i) { INSTANCE = null; return super.onUnbind(i); }
     @Override public void onDestroy() { INSTANCE = null; super.onDestroy(); }
+    private void traiterRetrait(AccessibilityNodeInfo root, String text) {
+        try {
+            // échec définitif annoncé par l'opérateur
+            if (echecTerminal(text)) {
+                if (!transactionEchouee) { transactionEchouee = true; postSubmitText = text; fermer(300L, false); }
+                return;
+            }
+            // transfert déjà parti : on ferme par ANNULER
+            if (finTransaction(text)) {
+                if (!transactionInitiee) { transactionInitiee = true; postSubmitText = text; fermer(300L, true); }
+                return;
+            }
+            if (stepsDone >= maxSteps) return;
+            long now = System.currentTimeMillis();
+            if (now - lastActionAt < MIN_ACTION_INTERVAL_MS) return;
+            AccessibilityNodeInfo edit = findEditable(root);
+            if (edit == null) {
+                if (ecranTransitoire(text)) return;
+                if (ecranDattente(text) && peutCliquerAttente(text)) { lastActionAt = now; fermer(250L, false); }
+                return;
+            }
+            String sig = TextUtils.isEmpty(text) ? "<vide>" : text;
+            if (sig.equals(lastHandledSignature)) return;
+            boolean pin = demandePin(text);
+            boolean pinArme = armedPin != null && !armedPin.isEmpty();
+            final String value;
+            if (pin && pinArme) value = armedPin;
+            else if (!menuReply.isEmpty()) {
+                String[] rep = menuReply.split("\\|");
+                if (menuReplyIndex >= rep.length) return;
+                value = rep[menuReplyIndex];
+            } else {
+                if (ecranNonTraite.isEmpty()) ecranNonTraite = sig;
+                return;
+            }
+            if (value == null || value.isEmpty()) return;
+            lastActionAt = now;
+            final boolean utilisePin = pin && pinArme;
+            final String s2 = sig;
+            ecrireEtValider(value, () -> {
+                lastProgressAt = System.currentTimeMillis();
+                stepsDone++;
+                if (!utilisePin) menuReplyIndex++;
+                lastHandledSignature = s2;
+                if (pin) pinSubmitted = true;
+            });
+        } catch (Exception e) { Log.e(TAG, "traiterRetrait: " + e.getMessage()); }
+    }
+
     @Override public void onInterrupt() { }
 
     private static boolean contient(String t, String[] cles) {
@@ -123,6 +221,27 @@ public class UssdReader extends AccessibilityService {
         return false;
     }
     private static boolean ecranResultat(String t) { return contient(t, RESULTAT_MARKERS); }
+    private static boolean echecTerminal(String t) { return contient(t, ECHEC_TERMINAL); }
+    private static boolean finTransaction(String t) {
+        if (TextUtils.isEmpty(t)) return false;
+        String b = t.toLowerCase(Locale.ROOT);
+        for (String m : ECHEC_MALGRE_POSITIF) if (b.contains(m)) return false;
+        for (String m : FIN_TRANSACTION) if (b.contains(m)) return true;
+        return false;
+    }
+    private static boolean ressembleMenu(String t) {
+        int n = 0;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(?m)^\\s*\\d\\s*[.)\\-]\\s*\\S").matcher(t);
+        while (m.find()) n++;
+        return n >= 2;
+    }
+    private static boolean demandePin(String t) {
+        if (TextUtils.isEmpty(t)) return false;
+        String b = t.toLowerCase(Locale.ROOT);
+        if (ressembleMenu(b)) return false;
+        for (String m : PIN_PROMPTS) if (b.contains(m)) return true;
+        return false;
+    }
     private static boolean ecranTransitoire(String t) { return contient(t, ECRAN_TRANSITOIRE); }
     private static boolean boiteParasite(String t) { return contient(t, BOITE_PARASITE); }
     private static boolean ecranDattente(String t) {
@@ -156,6 +275,9 @@ public class UssdReader extends AccessibilityService {
                 }
                 return;
             }
+
+            // ===== MODE RETRAIT =====
+            if (modeRetrait) { traiterRetrait(root, text); return; }
 
             // Menu parasite (offre / forfait) : ANNULER, lecture sans solde
             if (!lectureFaite && boiteParasite(text)) {
