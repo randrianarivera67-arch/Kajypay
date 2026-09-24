@@ -4,6 +4,9 @@ on:
     branches: [main]
     paths: ["apps/gateway/**", ".github/workflows/build-gateway.yml"]
   workflow_dispatch:
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -33,6 +36,40 @@ jobs:
           fi
       - run: gradle assembleDebug --no-daemon
         working-directory: apps/gateway
+      - name: Lire la version
+        id: ver
+        run: |
+          VC=$(grep -oE 'versionCode +[0-9]+' apps/gateway/app/build.gradle | grep -oE '[0-9]+')
+          VN=$(grep -oE 'versionName +"[^"]+"' apps/gateway/app/build.gradle | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "code=$VC" >> "$GITHUB_OUTPUT"
+          echo "nom=$VN" >> "$GITHUB_OUTPUT"
+      - name: Renommer l'APK
+        run: |
+          mkdir -p release
+          cp apps/gateway/app/build/outputs/apk/debug/*.apk "release/kajypay-gateway-${{ steps.ver.outputs.nom }}.apk"
+      - name: Publier la Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: gateway-v${{ steps.ver.outputs.nom }}
+          name: KajyPay gateway ${{ steps.ver.outputs.nom }}
+          files: release/*.apk
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Annoncer la version au serveur
+        if: ${{ secrets.MAJ_ADMIN_EMAIL != '' }}
+        env:
+          EMAIL: ${{ secrets.MAJ_ADMIN_EMAIL }}
+          MDP: ${{ secrets.MAJ_ADMIN_MDP }}
+          API: https://kajypay-api.randrianarivera67.workers.dev
+        run: |
+          JETON=$(curl -s -X POST "$API/auth/connexion" -H "Content-Type: application/json" \
+            -d "{\"email\":\"$EMAIL\",\"mot_de_passe\":\"$MDP\"}" | python3 -c "import sys,json;print(json.load(sys.stdin).get('jeton',''))")
+          if [ -z "$JETON" ]; then echo "Connexion super admin impossible, etape ignoree"; exit 0; fi
+          URL="https://github.com/${{ github.repository }}/releases/download/gateway-v${{ steps.ver.outputs.nom }}/kajypay-gateway-${{ steps.ver.outputs.nom }}.apk"
+          curl -s -X POST "$API/admin/versions" -H "Authorization: Bearer $JETON" -H "Content-Type: application/json" \
+            -d "{\"app\":\"gateway\",\"version_code\":${{ steps.ver.outputs.code }},\"version_nom\":\"${{ steps.ver.outputs.nom }}\",\"url\":\"$URL\"}"
+          echo ""
       - uses: actions/upload-artifact@v4
         with:
           name: kajypay-gateway
