@@ -734,7 +734,8 @@ public class MainActivity extends Activity {
         boolean autorise = smsAutorise();
         alerte.setVisibility(autorise ? View.GONE : View.VISIBLE);
         batterie.setVisibility(batterieOk() ? View.GONE : View.VISIBLE);
-        etat.setText(!autorise ? "●  Autorisation SMS manquante" : store.pause() ? "●  En pause" : KajyService.enMarche() ? "●  Service en marche" : "●  Service arrêté");
+        boolean srv = store.dernierContact() > 0 && System.currentTimeMillis() - store.dernierContact() < 180000;
+        etat.setText(!autorise ? "●  Autorisation SMS manquante" : store.pause() ? "●  En pause" : !srv ? "●  Serveur non joignable" : KajyService.enMarche() ? "●  Serveur connecté" : "●  Service arrêté");
         pauseBtn.setText(store.pause() ? "Reprendre" : "Pause");
         String op = operateurDe(simChoisie);
         simLabel.setText("SIM " + simChoisie + (op.isEmpty() ? "" : ", " + libelle(op)));
