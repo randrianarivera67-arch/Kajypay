@@ -227,6 +227,13 @@ public class MainActivity extends Activity {
         if (logoExiste(res)) {
             ImageView v = new ImageView(this);
             v.setImageResource(res);
+            v.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            GradientDrawable cadre = new GradientDrawable();
+            cadre.setShape(GradientDrawable.OVAL);
+            cadre.setColor(Color.WHITE);
+            v.setBackground(cadre);
+            v.setClipToOutline(true);
+            v.setOutlineProvider(android.view.ViewOutlineProvider.BACKGROUND);
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(taille), dp(taille));
             v.setLayoutParams(lp);
             return v;
@@ -523,7 +530,19 @@ public class MainActivity extends Activity {
                         try { brut = new JSONObject(brut).optString("code", brut); } catch (Exception ignore) { }
                         appairer(brut);
                     })
-                    .addOnFailureListener(e -> erreurConnexion.setText("Scanner indisponible sur ce téléphone. Saisissez le code à 8 caractères."));
+                    .addOnFailureListener(e -> {
+                        erreurConnexion.setText("Préparation du scanner…");
+                        try {
+                            com.google.android.gms.common.moduleinstall.ModuleInstallRequest req =
+                                com.google.android.gms.common.moduleinstall.ModuleInstallRequest.newBuilder()
+                                    .addApi(GmsBarcodeScanning.getClient(this)).build();
+                            com.google.android.gms.common.moduleinstall.ModuleInstall.getClient(this).installModules(req)
+                                .addOnSuccessListener(x -> erreurConnexion.setText("Scanner prêt, appuyez à nouveau."))
+                                .addOnFailureListener(x -> erreurConnexion.setText("Scanner indisponible. Saisissez le code à 8 caractères."));
+                        } catch (Exception ex) {
+                            erreurConnexion.setText("Scanner indisponible. Saisissez le code à 8 caractères.");
+                        }
+                    });
             } catch (Exception e) {
                 erreurConnexion.setText("Scanner indisponible sur ce téléphone. Saisissez le code à 8 caractères.");
             }
@@ -550,6 +569,7 @@ public class MainActivity extends Activity {
                     store.enregistrer(api, r.getString("jeton_appareil"), r.optString("nom", "Téléphone"), r.optJSONArray("sims") == null ? "[]" : r.getJSONArray("sims").toString());
                     store.setPause(false);
                     store.setSimsEnvoyees("");
+                    store.setDernierContact(System.currentTimeMillis());
                     runOnUiThread(this::demarrerApp);
                     return;
                 }
@@ -634,7 +654,11 @@ public class MainActivity extends Activity {
         ImageView logo = new ImageView(this);
         logo.setImageResource(R.drawable.ic_launcher);
         tete.addView(logo, new LinearLayout.LayoutParams(dp(32), dp(32)));
-        TextView titre = texte("KajyPay", 20, TEXT, true);
+        TextView titre = texte("", 22, TEXT, true);
+        android.text.SpannableString sp = new android.text.SpannableString("KajyPay");
+        sp.setSpan(new android.text.style.ForegroundColorSpan(TEXT), 0, 4, 0);
+        sp.setSpan(new android.text.style.ForegroundColorSpan(ACCENT), 4, 7, 0);
+        titre.setText(sp);
         titre.setPadding(dp(10), 0, 0, 0);
         tete.addView(titre, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
         tete.addView(texte(store.nom(), 13, MUTED, false));
@@ -699,9 +723,9 @@ public class MainActivity extends Activity {
         contenu.addView(rangee, plein(16));
 
         LinearLayout hero = new LinearLayout(this);
-        GradientDrawable heroFond = new GradientDrawable(GradientDrawable.Orientation.TL_BR, new int[]{Color.parseColor("#0F7A50"), Color.parseColor("#0B5638")});
-        heroFond.setCornerRadius(dp(22));
-        heroFond.setStroke(dp(3), Color.parseColor("#E8B94A"));
+        GradientDrawable heroFond = new GradientDrawable(GradientDrawable.Orientation.TL_BR, new int[]{Color.parseColor("#17A06A"), Color.parseColor("#0A4F33")});
+        heroFond.setCornerRadius(dp(24));
+        heroFond.setStroke(dp(4), Color.parseColor("#E8B94A"));
         hero.setBackground(heroFond);
         hero.setPadding(dp(16), dp(16), dp(16), dp(16));
         int clair = Color.parseColor("#BFE3CF"), pastille = Color.parseColor("#1E8A5E");
@@ -827,7 +851,7 @@ public class MainActivity extends Activity {
         alerte.setVisibility(autorise ? View.GONE : View.VISIBLE);
         batterie.setVisibility(batterieOk() ? View.GONE : View.VISIBLE);
         boolean srv = store.dernierContact() > 0 && System.currentTimeMillis() - store.dernierContact() < 180000;
-        etat.setText(!autorise ? "●  Autorisation SMS manquante" : store.pause() ? "●  En pause" : !srv ? "●  Serveur non joignable" : KajyService.enMarche() ? "●  Serveur connecté" : "●  Service arrêté");
+        etat.setText(!autorise ? "●  Autorisation SMS" : store.pause() ? "●  En pause" : !srv ? "●  Hors ligne" : KajyService.enMarche() ? "●  Serveur connecté" : "●  Service arrêté");
         pauseBtn.setText(store.pause() ? "Reprendre" : "Pause");
         String op = operateurDe(simChoisie);
         simLabel.setText("SIM " + simChoisie + (op.isEmpty() ? "" : ", " + libelle(op)));
@@ -857,9 +881,10 @@ public class MainActivity extends Activity {
                     maj = o.optLong("solde_maj", 0);
                 }
             }
-            soldeMontant.setText(m != null ? ar(m) + " Ar" : (code.isEmpty() ? "Non configuré" : "—"));
+            soldeMontant.setText(m != null ? ar(m) + " Ar" : "—");
+            soldeMontant.setTextSize(m != null ? 24 : 30);
             if (maj > 0) { long min = (System.currentTimeMillis() - maj) / 60000; soldeMaj.setText(min <= 0 ? "à l'instant" : "il y a " + min + " min"); }
-            else soldeMaj.setText(code.isEmpty() ? "Ajoutez le code USSD dans Réglages" : "Jamais vérifié");
+            else soldeMaj.setText(code.isEmpty() ? "Code USSD à définir" : "Jamais vérifié");
         }
         liste.removeAllViews();
         List<Journal.Ligne> ls = journal.rechercher(simChoisie, 0, null, true, 5);
