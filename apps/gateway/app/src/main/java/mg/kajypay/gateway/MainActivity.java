@@ -60,6 +60,7 @@ public class MainActivity extends Activity {
     private Journal journal;
     private final Handler h = new Handler(Looper.getMainLooper());
     private int onglet = -1, simChoisie = 1, histoSim = 0, histoPeriode = 0;
+    private String histoEtat = null, journalEtat = null;
     private String histoQ = "";
     private ScrollView scroll;
     private LinearLayout contenu, liste, alerte, batterie, listeHisto;
@@ -938,6 +939,13 @@ public class MainActivity extends Activity {
             per.addView(puce(noms[i], histoPeriode == i, v -> { histoPeriode = k; montrer(HISTORIQUE); }), libre());
         }
         contenu.addView(per, plein(8));
+        LinearLayout etats = new LinearLayout(this);
+        String[][] ev = {{null, "Tous"}, {"transmis", "Transmis"}, {"attente", "En attente"}, {"echoue", "Échoué"}};
+        for (String[] e : ev) {
+            final String cle = e[0];
+            etats.addView(puce(e[1], (cle == null && histoEtat == null) || (cle != null && cle.equals(histoEtat)), v -> { histoEtat = cle; montrer(HISTORIQUE); }), libre());
+        }
+        contenu.addView(etats, plein(8));
         EditText rech = new EditText(this);
         rech.setHint("Rechercher un montant ou un numéro");
         rech.setSingleLine(true);
@@ -963,7 +971,7 @@ public class MainActivity extends Activity {
     void majHistorique() {
         if (listeHisto == null) return;
         long depuis = histoPeriode == 0 ? debutJour() : histoPeriode == 1 ? debutJour() - 6L * 86400000L : 0;
-        List<Journal.Ligne> ls = journal.rechercher(histoSim, depuis, histoQ, true, 200);
+        List<Journal.Ligne> ls = journal.rechercher(histoSim, depuis, histoQ, histoEtat == null || "transmis".equals(histoEtat) || "attente".equals(histoEtat), 200, histoEtat);
         long total = 0, n = 0;
         for (Journal.Ligne l : ls) if ("reconnu".equals(l.statut) && l.facture) { total += l.montant; n++; }
         resumeHisto.setText(n + (n > 1 ? " paiements confirmés, " : " paiement confirmé, ") + ar(total) + " Ar");
@@ -982,13 +990,20 @@ public class MainActivity extends Activity {
         TextView s = texte("Tous les SMS Mobile Money reçus par ce téléphone, y compris ceux qui ont été ignorés.", 14, MUTED, false);
         s.setLineSpacing(0, 1.3f);
         contenu.addView(s, plein(6));
+        LinearLayout jEtats = new LinearLayout(this);
+        String[][] jv = {{null, "Tous"}, {"transmis", "Transmis"}, {"attente", "En attente"}, {"echoue", "Échoué"}};
+        for (String[] e : jv) {
+            final String cle = e[0];
+            jEtats.addView(puce(e[1], (cle == null && journalEtat == null) || (cle != null && cle.equals(journalEtat)), v -> { journalEtat = cle; montrer(JOURNAL); }), libre());
+        }
+        contenu.addView(jEtats, plein(12));
         long att = journal.enAttenteTotal();
         if (att > 0) {
             Button env = bouton("Envoyer les " + att + " SMS en attente", ACCENT, Color.WHITE, 0, 14);
             env.setOnClickListener(v -> new Thread(() -> { String m = Sync.envoyer(this); runOnUiThread(() -> { Toast.makeText(this, m, Toast.LENGTH_LONG).show(); montrer(JOURNAL); }); }).start());
             contenu.addView(env, plein(12));
         }
-        List<Journal.Ligne> ls = journal.rechercher(0, 0, null, false, 200);
+        List<Journal.Ligne> ls = journal.rechercher(0, 0, null, false, 200, journalEtat);
         if (ls.isEmpty()) { contenu.addView(texte("Aucun SMS Mobile Money reçu pour le moment.", 14, MUTED, false), plein(16)); return; }
         for (Journal.Ligne l : ls) contenu.addView(carteSms(l, true), plein(8));
     }

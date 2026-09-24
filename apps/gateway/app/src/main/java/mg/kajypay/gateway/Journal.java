@@ -54,12 +54,22 @@ public final class Journal extends SQLiteOpenHelper {
         return lire(getReadableDatabase().rawQuery("SELECT " + COLS + " FROM sms WHERE statut = 'attente' ORDER BY id LIMIT " + max, null));
     }
 
+    /** etat : null = tout, "attente", "transmis" (reconnu), "echoue" (ignore/doublon/erreur) */
     public List<Ligne> rechercher(int slot, long depuis, String q, boolean paiementsSeuls, int max) {
+        return rechercher(slot, depuis, q, paiementsSeuls, max, null);
+    }
+
+    public List<Ligne> rechercher(int slot, long depuis, String q, boolean paiementsSeuls, int max, String etatFiltre) {
         StringBuilder w = new StringBuilder("recu_le >= ?");
         List<String> a = new ArrayList<>();
         a.add(String.valueOf(depuis));
         if (slot > 0) { w.append(" AND slot = ?"); a.add(String.valueOf(slot)); }
         if (paiementsSeuls) w.append(" AND statut IN ('reconnu','attente')");
+        if (etatFiltre != null) {
+            if ("attente".equals(etatFiltre)) w.append(" AND statut = 'attente'");
+            else if ("transmis".equals(etatFiltre)) w.append(" AND statut = 'reconnu'");
+            else if ("echoue".equals(etatFiltre)) w.append(" AND statut NOT IN ('reconnu','attente')");
+        }
         if (q != null && !q.trim().isEmpty()) {
             w.append(" AND (texte LIKE ? OR CAST(montant AS TEXT) LIKE ?)");
             a.add("%" + q.trim() + "%");
