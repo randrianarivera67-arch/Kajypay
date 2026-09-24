@@ -57,12 +57,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Annoncer la version au serveur
-        if: ${{ secrets.MAJ_ADMIN_EMAIL != '' }}
         env:
           EMAIL: ${{ secrets.MAJ_ADMIN_EMAIL }}
           MDP: ${{ secrets.MAJ_ADMIN_MDP }}
           API: https://kajypay-api.randrianarivera67.workers.dev
         run: |
+          if [ -z "$EMAIL" ]; then echo "Pas de secret MAJ_ADMIN_EMAIL, etape ignoree"; exit 0; fi
           JETON=$(curl -s -X POST "$API/auth/connexion" -H "Content-Type: application/json" \
             -d "{\"email\":\"$EMAIL\",\"mot_de_passe\":\"$MDP\"}" | python3 -c "import sys,json;print(json.load(sys.stdin).get('jeton',''))")
           if [ -z "$JETON" ]; then echo "Connexion super admin impossible, etape ignoree"; exit 0; fi
