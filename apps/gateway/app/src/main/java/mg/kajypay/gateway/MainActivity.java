@@ -568,15 +568,14 @@ public class MainActivity extends Activity {
     void construireCadre() {
         LinearLayout racine = colonne();
         racine.setBackgroundColor(BG);
+        VagueOr vagueHaut = new VagueOr(this, true);
+        racine.addView(vagueHaut, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(14)));
         scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         contenu = colonne();
         contenu.setPadding(dp(20), dp(24), dp(20), dp(24));
         scroll.addView(contenu);
         racine.addView(scroll, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
-        View sep = new View(this);
-        sep.setBackgroundColor(LINE);
-        racine.addView(sep, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)));
         LinearLayout nav = new LinearLayout(this);
         nav.setBackgroundColor(BG);
         nav.setPadding(dp(8), dp(4), dp(8), dp(8));
@@ -585,6 +584,8 @@ public class MainActivity extends Activity {
         nav.addView(navBouton("Historique", R.drawable.ic_list, HISTORIQUE), poids(0));
         nav.addView(navBouton("Réglages", R.drawable.ic_settings, REGLAGES), poids(0));
         racine.addView(nav, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        VagueOr vagueBas = new VagueOr(this, false);
+        racine.addView(vagueBas, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(14)));
         setContentView(racine);
     }
 
