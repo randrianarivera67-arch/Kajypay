@@ -68,6 +68,22 @@ export async function gererClient(request, env, url, u) {
     await db(env, [{ sql: "UPDATE lignes_sim SET code_ussd_solde = ? WHERE appareil_id = ? AND slot = ?", args: [code, appareilId, slot] }]);
     return json({ ok: true });
   }
+  if (m === "GET" && p === "/client/retraits") {
+    const [c] = await db(env, [{ sql: "SELECT retrait_autorise FROM clients WHERE id = ?", args: [cid] }]);
+    const [r] = await db(env, [{ sql: "SELECT id, operateur, numero_beneficiaire, montant_ar, reference_client, statut, texte_operateur, motif, cree_le, fini_le FROM retraits WHERE client_id = ? ORDER BY cree_le DESC LIMIT 100", args: [cid] }]);
+    return json({ ok: true, retrait_autorise: c.rows[0] ? c.rows[0].retrait_autorise : 0, retraits: r.rows });
+  }
+  if (m === "POST" && p === "/client/retraits") {
+    const [c] = await db(env, [{ sql: "SELECT retrait_autorise FROM clients WHERE id = ?", args: [cid] }]);
+    if (!c.rows[0] || c.rows[0].retrait_autorise !== 1) return json({ ok: false, erreur: "retrait non autorise pour ce compte" }, 403);
+    const { operateur, numero_beneficiaire, montant_ar, reference_client } = await lireCorps(request);
+    if (!OPS.includes(operateur)) return json({ ok: false, erreur: "operateur invalide" }, 400);
+    if (typeof numero_beneficiaire !== "string" || !/^0\d{9}$/.test(numero_beneficiaire.replace(/\s/g, ""))) return json({ ok: false, erreur: "numero beneficiaire invalide" }, 400);
+    if (!Number.isInteger(montant_ar) || montant_ar < 100 || montant_ar > 5000000) return json({ ok: false, erreur: "montant invalide (100 a 5000000)" }, 400);
+    const id = crypto.randomUUID();
+    await db(env, [{ sql: "INSERT INTO retraits (id, client_id, appareil_id, sim_slot, operateur, numero_beneficiaire, montant_ar, reference_client, statut, cree_le) VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, 'en_attente', ?)", args: [id, cid, operateur, numero_beneficiaire.replace(/\s/g, ""), montant_ar, txt(reference_client, 40), Date.now()] }]);
+    return json({ ok: true, retrait_id: id }, 201);
+  }
   const ms = p.match(/^\/client\/appareils\/([0-9a-f-]{36})\/sims\/([12])$/);
   if (m === "POST" && ms) {
     if (u.role !== "client_admin") return json({ ok: false, erreur: "interdit" }, 403);

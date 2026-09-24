@@ -4,7 +4,7 @@ import { json, lireCorps, emailValide } from "./http.js";
 export async function gererAdmin(request, env, url) {
   const m = request.method, p = url.pathname;
   if (m === "GET" && p === "/admin/clients") {
-    const [r] = await db(env, [{ sql: "SELECT c.id, c.nom, c.telephone, c.solde_ar, c.tarif_sms_ar, c.minimum_mensuel_ar, c.statut, c.cree_le, (SELECT email FROM utilisateurs u WHERE u.client_id = c.id AND u.role = 'client_admin' LIMIT 1) AS email_admin, (SELECT COUNT(*) FROM appareils a WHERE a.client_id = c.id) AS appareils FROM clients c ORDER BY c.cree_le DESC" }]);
+    const [r] = await db(env, [{ sql: "SELECT c.id, c.nom, c.telephone, c.solde_ar, c.tarif_sms_ar, c.minimum_mensuel_ar, c.statut, c.retrait_autorise, c.cree_le, (SELECT email FROM utilisateurs u WHERE u.client_id = c.id AND u.role = 'client_admin' LIMIT 1) AS email_admin, (SELECT COUNT(*) FROM appareils a WHERE a.client_id = c.id) AS appareils FROM clients c ORDER BY c.cree_le DESC" }]);
     return json({ ok: true, clients: r.rows });
   }
   if (m === "POST" && p === "/admin/clients") {
@@ -22,6 +22,12 @@ export async function gererAdmin(request, env, url) {
       { sql: "INSERT INTO utilisateurs (id, client_id, email, mot_de_passe_hash, role, actif, cree_le) VALUES (?, ?, ?, ?, 'client_admin', 1, ?)", args: [crypto.randomUUID(), clientId, email, await hacherMotDePasse(mot_de_passe_admin), now] }
     ]);
     return json({ ok: true, client_id: clientId }, 201);
+  }
+  const ra = p.match(/^\/admin\/clients\/([0-9a-f-]{36})\/retrait-autorise$/);
+  if (m === "POST" && ra) {
+    const { autorise } = await lireCorps(request);
+    await db(env, [{ sql: "UPDATE clients SET retrait_autorise = ? WHERE id = ?", args: [autorise ? 1 : 0, ra[1]] }]);
+    return json({ ok: true, retrait_autorise: autorise ? 1 : 0 });
   }
   const rech = p.match(/^\/admin\/clients\/([0-9a-f-]{36})\/recharge$/);
   if (m === "POST" && rech) {

@@ -70,6 +70,26 @@ export async function gererGateway(request, env, url) {
     await db(env, [{ sql: "UPDATE lignes_sim SET code_ussd_solde = ? WHERE appareil_id = ? AND slot = ?", args: [code || null, app.id, slot] }]);
     return json({ ok: true });
   }
+  if (request.method === "GET" && p === "/gateway/retraits-attente") {
+    const ls = await lignes(env, app.id);
+    const ops = ls.filter(l => l.actif === 1).map(l => l.operateur);
+    if (!ops.length) return json({ ok: true, retraits: [] });
+    const ph = ops.map(() => "?").join(",");
+    const [r] = await db(env, [{ sql: `SELECT id, operateur, numero_beneficiaire, montant_ar, reference_client FROM retraits WHERE client_id = ? AND statut = 'en_attente' AND operateur IN (${ph}) ORDER BY cree_le LIMIT 5`, args: [app.client_id, ...ops] }]);
+    return json({ ok: true, retraits: r.rows });
+  }
+  if (p === "/gateway/retrait-prendre") {
+    const { retrait_id } = await lireCorps(request);
+    if (typeof retrait_id !== "string") return json({ ok: false, erreur: "retrait_id manquant" }, 400);
+    const [u] = await db(env, [{ sql: "UPDATE retraits SET statut = 'pris', appareil_id = ?, pris_le = ? WHERE id = ? AND client_id = ? AND statut = 'en_attente'", args: [app.id, Date.now(), retrait_id, app.client_id] }]);
+    return json({ ok: u.changes > 0, deja_pris: u.changes === 0 });
+  }
+  if (p === "/gateway/retrait-resultat") {
+    const { retrait_id, statut, sim_slot, texte, motif } = await lireCorps(request);
+    if (!["envoye", "confirme", "echoue"].includes(statut)) return json({ ok: false, erreur: "statut invalide" }, 400);
+    await db(env, [{ sql: "UPDATE retraits SET statut = ?, sim_slot = ?, texte_operateur = ?, motif = ?, fini_le = ? WHERE id = ? AND client_id = ?", args: [statut, Number.isInteger(sim_slot) ? sim_slot : null, typeof texte === "string" ? texte.slice(0, 300) : null, typeof motif === "string" ? motif.slice(0, 200) : null, Date.now(), retrait_id, app.client_id] }]);
+    return json({ ok: true });
+  }
   if (p === "/gateway/solde") {
     const { slot, montant_ar, texte } = await lireCorps(request);
     if (![1, 2].includes(slot)) return json({ ok: false, erreur: "slot invalide" }, 400);
