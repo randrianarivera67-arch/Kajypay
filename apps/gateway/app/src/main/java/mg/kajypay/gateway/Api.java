@@ -12,6 +12,25 @@ import java.nio.charset.StandardCharsets;
 public final class Api {
     public static final String DEFAULT_API = "https://kajypay-api.randrianarivera67.workers.dev";
 
+    public static String get(String url, String auth) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setRequestMethod("GET");
+        c.setConnectTimeout(15000);
+        c.setReadTimeout(20000);
+        if (auth != null) c.setRequestProperty("Authorization", auth);
+        int code = c.getResponseCode();
+        InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+        StringBuilder sb = new StringBuilder();
+        if (in != null) {
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+                String l;
+                while ((l = r.readLine()) != null) sb.append(l);
+            }
+        }
+        c.disconnect();
+        return sb.toString();
+    }
+
     public static String post(String url, String body, String auth) throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setRequestMethod("POST");
