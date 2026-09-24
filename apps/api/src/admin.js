@@ -23,6 +23,19 @@ export async function gererAdmin(request, env, url) {
     ]);
     return json({ ok: true, client_id: clientId }, 201);
   }
+  if (m === "GET" && p === "/admin/versions") {
+    const [r] = await db(env, [{ sql: "SELECT app, version_code, version_nom, url, notes, obligatoire, maj FROM versions_app ORDER BY app" }]);
+    return json({ ok: true, versions: r.rows });
+  }
+  if (m === "POST" && p === "/admin/versions") {
+    const { app, version_code, version_nom, url, notes, obligatoire } = await lireCorps(request);
+    if (typeof app !== "string" || !/^[a-z0-9_-]{2,20}$/.test(app)) return json({ ok: false, erreur: "app invalide" }, 400);
+    if (!Number.isInteger(version_code) || version_code < 1) return json({ ok: false, erreur: "version_code invalide" }, 400);
+    if (typeof version_nom !== "string" || !version_nom.trim()) return json({ ok: false, erreur: "version_nom requis" }, 400);
+    if (typeof url !== "string" || !/^https:\/\//.test(url)) return json({ ok: false, erreur: "url https requise" }, 400);
+    await db(env, [{ sql: "INSERT INTO versions_app (app, version_code, version_nom, url, notes, obligatoire, maj) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(app) DO UPDATE SET version_code = excluded.version_code, version_nom = excluded.version_nom, url = excluded.url, notes = excluded.notes, obligatoire = excluded.obligatoire, maj = excluded.maj", args: [app, version_code, version_nom.trim().slice(0, 20), url.slice(0, 300), typeof notes === "string" ? notes.slice(0, 300) : null, obligatoire ? 1 : 0, Date.now()] }]);
+    return json({ ok: true });
+  }
   if (m === "GET" && p === "/admin/modeles-retrait") {
     const [r] = await db(env, [{ sql: "SELECT operateur, code, pin_separe, max_steps, maj FROM modeles_retrait" }]);
     return json({ ok: true, modeles: r.rows });

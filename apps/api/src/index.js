@@ -44,6 +44,13 @@ export default {
         if (!u) return json({ ok: false, erreur: "non connecte" }, 401);
         return json({ ok: true, utilisateur: { id: u.sub, role: u.role, client_id: u.client_id } });
       }
+      const maj = url.pathname.match(/^\/maj\/([a-z0-9_-]{2,20})$/);
+      if (request.method === "GET" && maj) {
+        const [r] = await db(env, [{ sql: "SELECT app, version_code, version_nom, url, notes, obligatoire FROM versions_app WHERE app = ?", args: [maj[1]] }]);
+        if (!r.rows.length) return json({ ok: true, disponible: false });
+        const v = r.rows[0];
+        return json({ ok: true, disponible: true, version_code: v.version_code, version_nom: v.version_nom, url: v.url, notes: v.notes, obligatoire: v.obligatoire === 1 });
+      }
       if (url.pathname.startsWith("/gateway/")) return gererGateway(request, env, url);
       if (url.pathname.startsWith("/client/")) {
         const u = await utilisateurCourant(request, env);
