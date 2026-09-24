@@ -85,6 +85,7 @@ public class MainActivity extends Activity {
         store = new Store(this);
         journal = new Journal(this);
         if (store.estAppaire()) demarrerApp(); else afficherConnexion();
+        MiseAJour.verifier(this, store.api(), false);
         afficherDernierCrash();
     }
 
