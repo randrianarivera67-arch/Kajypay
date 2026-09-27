@@ -4,7 +4,7 @@ import android.content.Context;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** Liaison consultation de solde : delegue a UssdEngine (moteur repris de l'ancienne passerelle). */
+/** Consultation de solde : passe par la FILE USSD (jamais en collision avec un retrait). */
 public final class SoldeUssd {
     public interface Callback { void onResult(boolean ok, Long montantAr, String texte); }
 
@@ -19,11 +19,10 @@ public final class SoldeUssd {
         return best;
     }
 
-    /** code peut contenir '|' (UssdEngine gere le multi-etape lui-meme). */
     public static void consulter(Context c, int slot, String code, Callback cb) {
         if (code == null || code.trim().isEmpty()) { cb.onResult(false, null, "Aucun code USSD configuré"); return; }
         String op = operateurDeSlot(c, slot);
-        UssdEngine.lireSoldeUssd(c, "solde-" + slot + "-" + System.currentTimeMillis(), code, op,
+        UssdQueue.enqueueLectureSolde(c, op.isEmpty() ? ("slot" + slot) : op, code,
             (ref, success, response) -> cb.onResult(success, success ? montant(response) : null, response));
     }
 

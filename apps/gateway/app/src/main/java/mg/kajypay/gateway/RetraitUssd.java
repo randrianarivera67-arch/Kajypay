@@ -5,17 +5,16 @@ import android.util.Log;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-/** Liaison retrait : recupere un retrait, delegue l'envoi USSD a UssdEngine, rend le resultat. */
+/** Retrait : recupere un ordre, l'envoie via la FILE USSD (jamais en collision avec le solde), rend le resultat. */
 public final class RetraitUssd {
     private static final String TAG = "RetraitUssd";
-    private static volatile boolean enCours = false;
 
-    public static boolean estEnCours() { return enCours; }
+    public static boolean estEnCours() { return UssdQueue.enCours() != null; }
 
     public static synchronized void traiterUn(Context c) {
-        if (enCours) return;
         Store s = new Store(c);
         if (!s.estAppaire() || s.pause() || !UssdReader.isEnabled(c)) return;
+        if (UssdQueue.enCours() != null) return; // une session USSD a la fois
         try {
             JSONObject r = new JSONObject(Api.post(s.api() + "/gateway/retraits-attente", "{}", "Appareil " + s.jeton()));
             if (!r.optBoolean("ok")) return;
@@ -36,16 +35,13 @@ public final class RetraitUssd {
     }
 
     private static void executer(Context c, Store s, JSONObject ret) {
-        enCours = true;
-        String id = ret.optString("id"), op = ret.optString("operateur");
-        String num = ret.optString("numero_beneficiaire"), pin = ret.optString("pin_chiffre");
+        final String id = ret.optString("id"), op = ret.optString("operateur");
+        final String num = ret.optString("numero_beneficiaire"), pin = ret.optString("pin_chiffre");
         long montant = ret.optLong("montant_ar");
-        int slotNo = ret.optInt("sim_slot", 0);
+        final int slotNo = ret.optInt("sim_slot", 0);
         boolean pinSepare = ret.optInt("retrait_pin_separe", 0) == 1;
         int steps = ret.optInt("retrait_max_steps", 1);
-        String m = String.valueOf(montant);
-        String code = subst(ret.optString("retrait_code", ""), num, m, pin);
-        // separer dial et menu ; injecter le PIN separe en fin de menu si demande
+        String code = subst(ret.optString("retrait_code", ""), num, String.valueOf(montant), pin);
         String dial = code, menu = "";
         if (code.indexOf('|') >= 0) {
             String[] p = code.split("\\|");
@@ -55,14 +51,15 @@ public final class RetraitUssd {
             menu = sb.toString();
             if (steps < p.length - 1) steps = p.length - 1;
         }
-        final String pinArme = pinSepare ? pin : "";
-        UssdEngine.sendUssdInteractive(c, id, dial, opMaj(op), pinArme, menu, Math.max(steps, 1),
+        String pinArme = pinSepare ? pin : "";
+        UssdQueue.Job job = new UssdQueue.Job(id, dial, opMaj(op), pinArme, menu, Math.max(steps, 1),
             (rid, success, response) -> {
                 String statut = success ? "envoye" : "echoue";
                 String motif = success ? "Transfert initié (confirmation par SMS)" : ("Échec : " + response);
-                rendre(c, s, rid, statut, slotNo, response, motif);
-                enCours = false;
+                rendre(c, s, id, statut, slotNo, response, motif);
+                if (success && slotNo > 0) BalanceScheduler.apresMouvement(c, slotNo);
             });
+        UssdQueue.enqueue(c, job);
     }
 
     private static void rendre(Context c, Store s, String id, String statut, int slot, String texte, String motif) {
