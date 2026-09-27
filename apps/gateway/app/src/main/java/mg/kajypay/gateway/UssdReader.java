@@ -12,433 +12,1616 @@ import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
 /**
- * Service d'accessibilité : lit l'écran des boîtes USSD pour relever le solde
- * Mobile Money, et ferme sans jamais rien saisir les menus parasites (offres,
- * achat de forfait) — protection issue de l'ancienne passerelle SMS.
+ * Saisit automatiquement le code PIN dans la boite de dialogue USSD de l'operateur.
  *
- * KajyPay ne fait que CONSULTER : aucune saisie de PIN, aucun envoi d'argent.
- * Une seule séquence de menu (facultative) peut être tapée avant lecture, pour
- * les codes multi-étapes (ex. Airtel "*436#|6|2|2011").
+ * POURQUOI CE SERVICE EST NECESSAIRE
+ * ----------------------------------
+ * TelephonyManager.sendUssdRequest() est une API "one-shot" : elle envoie un code
+ * et recoit UNE reponse. Elle ne sait pas repondre a une invite USSD du type
+ * "Ampidiro ny kaody miafina" (Orange). Or Orange refuse un code USSD contenant
+ * deja le PIN : il faut le taper dans la boite de dialogue affichee par le systeme.
+ *
+ * Ce service surveille l'apparition de cette boite, y ecrit le PIN, puis appuie
+ * sur "Envoyer". C'est la seule methode fiable sous Android pour un USSD interactif.
+ *
+ * SECURITE
+ * --------
+ * - Le PIN n'est jamais journalise (masque dans les logs).
+ * - Le service n'agit QUE s'il a ete "arme" juste avant par le GatewayService,
+ *   et seulement pendant une fenetre de temps courte (ARM_TIMEOUT_MS).
+ * - Une seule saisie par armement : impossible de rejouer un PIN.
+ *
+ * COMPATIBILITE
+ * -------------
+ * Fonctionne d'Android 5.0 (API 21) a Android 15 (API 35). Les libelles de bouton
+ * et les identifiants de vue varient selon les constructeurs (stock, Samsung,
+ * Xiaomi/MIUI, Oppo/Realme, Huawei, Transsion) : la detection combine plusieurs
+ * strategies (viewId, libelle multilingue, position, type de noeud).
  */
 public class UssdReader extends AccessibilityService {
-    private static final String TAG = "UssdReader";
+
+    private static final String TAG = "UssdAccess";
+
+    /** Duree pendant laquelle un PIN arme reste valable. */
     private static final long ARM_TIMEOUT_MS = 90_000L;
+
+    /** Anti-rebond : evite de re-traiter la meme boite plusieurs fois. */
     private static final long MIN_ACTION_INTERVAL_MS = 800L;
-    private static final long ATTENTE_REPEAT_MS = 3000L;
 
-    private static volatile UssdReader INSTANCE = null;
-    private static volatile boolean actif = false;
-    private static volatile String reference = null;
-    private static volatile String menuReply = "";
-    private static volatile int maxSteps = 0, menuReplyIndex = 0;
-    private static volatile long armedAt = 0L, lastProgressAt = 0L, lastAttenteAt = 0L;
-    private static volatile boolean lectureFaite = false;
-    private static volatile String texteLu = "", lastAttenteSignature = "", lastHandledSignature = "";
-    private static volatile int attenteClics = 0;
+    // ---- Etat partage (arme par UssdQueue avant l'envoi du code USSD) ----
+    // UN SEUL retrait peut etre arme a la fois : UssdQueue le garantit en
+    // n'executant jamais deux retraits en parallele. arm() refuse tout de meme
+    // un second armement, par securite.
+    private static volatile String  armedPin      = null;
+    /** Reponse a taper sur un ecran de saisie qui n'est PAS une demande de PIN. */
+    private static volatile String  armedMenuReply = "";
+    /** Nombre maximum d'ecrans de saisie a traiter (Orange en demande 2). */
+    private static volatile int     armedMaxSteps  = 1;
+    /** Nombre d'ecrans reellement traites. */
+    private static volatile int     stepsDone      = 0;
+    /** Multi-etape : index de la reponse courante dans la sequence menuReply
+     *  (separee par '|'). Avance a chaque ecran menu valide. */
+    private static volatile int     menuReplyIndex = 0;
+    // Ecrans d'attente ("tsindrio ny ok") : suivi SEPARE du reste. Le meme texte
+    // peut reapparaitre plusieurs fois dans une sequence (une fois par choix de
+    // menu) : une simple comparaison de texte le prendrait pour "deja traite" et
+    // la sequence resterait bloquee. On autorise donc un nouveau clic passe un
+    // court delai, ce qui evite aussi de cliquer en rafale sur la meme boite.
+    // Horodatage du dernier ecran traite. Sert au DIAGNOSTIC uniquement.
+    //
+    // Une expiration de cette garde avait ete essayee, pour distinguer deux
+    // etapes affichant le meme libelle. Elle a ete RETIREE : si un ecran reste
+    // affiche au-dela du delai — clic sans effet, operateur lent — la garde
+    // laissait passer un nouvel evenement et la reponse SUIVANTE de la sequence
+    // etait tapee dans l'ecran PRECEDENT. Sur un flux d'argent, ce risque reel
+    // pese plus lourd que le cas suppose de deux libelles identiques.
+    // La garde est donc definitive, comme a l'origine.
+    private static volatile long    lastHandledAt = 0L;
+    private static volatile String  lastFinalSignature = "";
+    private static volatile String  lastAttenteSignature = "";
+    private static volatile long    lastAttenteAt = 0L;
+    private static final long       ATTENTE_REPEAT_MS = 3000L;
+    /** Texte du dernier ecran de saisie qu'on n'a PAS su remplir (diagnostic). */
+    private static volatile String  ecranNonTraite = "";
+    private static volatile long    armedAt       = 0L;
+    private static volatile String  armedRetraitId = null;
+    private static volatile String  lastDialogText = "";
+    /**
+     * Texte lu APRES la saisie validee. Sans lui on remonte au serveur l'ecran
+     * "Ampidiro ny kaody miafina" lui-meme, et le serveur ne peut pas savoir si
+     * le PIN a ete tape ou non.
+     */
+    private static volatile String  postSubmitText = "";
+    private static volatile boolean pinSubmitted   = false;
+    /** true des qu'un ecran confirme que le transfert est parti chez l'operateur. */
+    private static volatile boolean transactionInitiee = false;
+    /** true des qu'un ecran annonce un echec definitif de l'operateur. */
+    private static volatile boolean transactionEchouee = false;
+    /** Dernier refus de menu d'offres : evite de cliquer en rafale sur une
+     *  suite d'evenements decrivant le meme ecran. */
+    private static volatile long dernierRefusOffre = 0L;
+
+    /** Signature du dernier ecran auquel on a repondu : evite la double reponse. */
+    private static volatile String lastHandledSignature = "";
+
     private long lastActionAt = 0L;
-    // --- mode retrait ---
-    private static volatile boolean modeRetrait = false;
-    private static volatile String armedPin = null;
-    private static volatile int stepsDone = 0;
-    private static volatile boolean pinSubmitted = false, transactionInitiee = false, transactionEchouee = false;
-    private static volatile String postSubmitText = "", ecranNonTraite = "";
 
-    private static final String[] BOITE_PARASITE = {
-        "hampiditra tolotra", "achat recharge et offre", "acheter", "forfait",
-        "mon compte/mot de passe", "services/factures", "offre"
-    };
-    private static final String[] ATTENTE_MARKERS = {
-        "ampanatontosana", "fangatahana", "andraso", "mahandrasa", "tsindrio ny ok",
-        "en cours de traitement", "traitement en cours", "veuillez patienter",
-        "patientez", "please wait", "processing"
-    };
-    private static final String[] RESULTAT_MARKERS = {
-        "toe bola", "toe-bola", "solde", "trans id", "reference", "ref:",
-        "ariary", " ar ", "mga", "montant", "vola voaray", "balance"
-    };
-    private static final String[] ECRAN_TRANSITOIRE = {
-        "execution du code ussd", "ex\u00e9cution du code", "envoi de la demande",
-        "running ussd", "connexion en cours", "mandefa ny fangatahana"
-    };
-    private static final String[] SEND_LABELS = {
-        "envoyer", "send", "ok", "alefa", "valider", "confirmer", "confirm",
-        "continuer", "continue", "suivant", "next", "yes", "eny", "submit", "envoi"
-    };
-    private static final String[] CANCEL_LABELS = {
-        "annuler", "cancel", "aoka", "fermer", "close", "non", "no", "tsia",
-        "retour", "back", "dismiss", "quitter"
-    };
-    private static final int ATTENTE_CLICS_MAX = 6;
-    private static final String[] FIN_TRANSACTION = {
-        "transfert initie", "transfert initi", "vous allez recevoir une confirmation",
-        "est reussi", "est r\u00e9ussi", "transaction a reussi", "transaction a r\u00e9ussi",
-        "repertoire mvola", "r\u00e9pertoire mvola", "comme favori", "enregistrer ce numero",
-        "transaction en cours", "nahomby", "vita soa aman-tsara"
-    };
-    private static final String[] ECHEC_MALGRE_POSITIF = {
-        "n'a pas reussi", "pas reussi", "pas r\u00e9ussi", "non reussi", "echoue", "\u00e9chou\u00e9", "echec", "\u00e9chec", "tsy nahomby"
-    };
-    private static final String[] ECHEC_TERMINAL = {
-        "insuffisant", "code secret incorrect", "code incorrect", "code errone", "numero incorrect",
-        "numero invalide", "transaction impossible", "operation impossible", "service indisponible",
-        "reessayez", "montant invalide", "compte bloque", "une erreur", "erreur est survenue",
-        "an error occurred", "ihm non valide", "code ihm", "unknown application", "try again",
-        "insufficient", "invalid", "incorrect", "tsy ampy", "kaody diso", "tsy mety", "andramo indray"
-    };
+    /**
+     * Motifs indiquant qu'un ecran demande le CODE SECRET (mg / fr / en).
+     * Sert a garantir que le PIN n'est jamais tape dans un champ de menu.
+     */
     private static final String[] PIN_PROMPTS = {
-        "kaody miafina", "code secret", "code pin", "votre pin", "code confidentiel",
-        "mot de passe", "enter your pin", "enter pin", "secret code"
+            "kaody miafina",     // mg : "Ampidiro ny kaody miafina"
+            "code secret",       // fr : "entrez votre code secret"
+            "code pin", "votre pin", "code confidentiel",
+            "mot de passe",
+            "enter your pin", "enter pin", "secret code"
     };
 
+    /**
+     * Ecrans signifiant que le transfert est DEJA PARTI chez l'operateur.
+     * Cas reel Orange Money : apres la saisie du PIN, une derniere boite
+     * s'affiche — "Transfert initie. Vous allez recevoir une confirmation par
+     * SMS. 1: enregistrer le numero ... 2: ne pas enregistrer ..." — avec un
+     * champ de saisie. Ce n'est PAS une etape de la transaction : elle est
+     * terminee. Ce menu ne sert qu'au repertoire telephonique.
+     * On ferme donc la session par ANNULER, sans rien saisir, et on enchaine
+     * sur le retrait suivant.
+     */
+    private static final String[] FIN_TRANSACTION = {
+            // --- Orange Money ---
+            "transfert initie", "transfert initi",
+            "vous allez recevoir une confirmation",
+            "est reussi", "est réussi",
+            // --- MVola / Telma (releve sur telephone) ---
+            // "Votre transaction a reussi, pour enregistrer 0380990983 dans
+            //  votre repertoire MVola, Entrer le nom correspondant ou ignorer :"
+            "transaction a reussi", "transaction a réussi",
+            "repertoire mvola", "répertoire mvola",
+            // --- Airtel Money ---
+            // Dernier ecran apres un transfert REUSSI : "Enregistrer ce numero
+            // comme favori? 1. Oui 2. Non". Repondre n'a aucun effet sur
+            // l'argent, deja parti. Non reconnue, cette boite restait ouverte
+            // jusqu'a l'expiration de la session ("code IHM non valide") et le
+            // retrait etait declare en echec alors qu'il avait abouti.
+            "comme favori", "enregistrer ce numero", "numero comme favori",
+            // --- commun ---
+            "transaction en cours",
+            "nahomby", "vita soa aman-tsara"
+    };
+
+    /**
+     * Formulations d'ECHEC contenant un mot de succes ("n'a pas reussi").
+     * Testees en premier : sans cela on fermerait la boite par ANNULER en
+     * croyant la transaction partie, alors qu'elle a echoue.
+     * NE JAMAIS y mettre "annul" : les libelles des boutons font partie du
+     * texte lu et provoqueraient un faux echec sur tous les ecrans.
+     */
+    /**
+     * Ecrans annoncant un ECHEC DEFINITIF de l'operateur. Cas reel MVola :
+     * "Votre solde MVola est insuffisant. Votre solde est de 5 692Ar. Faites un
+     *  depot MVola suffisant pour pouvoir effectuer cette transaction. Ref:..."
+     * avec un SEUL bouton OK et AUCUN champ de saisie.
+     *
+     * Sans ce traitement, la boite restait affichee : le service ne trouvait pas
+     * de champ a remplir et ne faisait rien. On attendait alors le delai complet
+     * (25 s) pour conclure, et la boite pouvait genait le retrait suivant.
+     * On la ferme donc immediatement et on conclut sans attendre.
+     */
+    private static final String[] ECHEC_TERMINAL = {
+            // --- francais ---
+            "insuffisant",
+            "code secret incorrect", "code incorrect", "code errone",
+            "numero incorrect", "numero invalide", "numero inconnu",
+            "transaction impossible", "operation impossible",
+            "service indisponible", "reessayez plus tard", "reessayer plus tard",
+            "montant invalide", "montant incorrect",
+            "compte bloque", "compte suspendu",
+            "une erreur", "erreur est survenue",
+            // --- anglais : Orange repond en anglais sur certaines erreurs ---
+            // "An error occurred while processing your request. We will be
+            //  solving it shortly. Please try again later."
+            "an error occurred", "error occurred", "error while processing",
+            "ihm non valide", "code ihm", "de connexion", "unknown application", "application inconnue",
+            "try again later", "please try again",
+            "insufficient", "invalid", "incorrect",
+            "service unavailable", "temporarily unavailable",
+            // --- malgache ---
+            "tsy ampy", "kaody diso", "tsy mety", "andramo indray"
+    };
+
+    private static boolean echecTerminal(String texte) {
+        if (TextUtils.isEmpty(texte)) return false;
+        String t = texte.toLowerCase(Locale.ROOT);
+        for (String m : ECHEC_TERMINAL) if (t.contains(m)) return true;
+        return false;
+    }
+
+    private static final String[] ECHEC_MALGRE_MOT_POSITIF = {
+            "n'a pas reussi", "na pas reussi", "pas reussi", "pas réussi",
+            "non reussi", "non réussi",
+            "echoue", "échoué", "echec", "échec",
+            "tsy nahomby"
+    };
+
+    private static boolean transactionDejaPartie(String texte) {
+        if (TextUtils.isEmpty(texte)) return false;
+        String t = texte.toLowerCase(Locale.ROOT);
+        for (String m : ECHEC_MALGRE_MOT_POSITIF) if (t.contains(m)) return false;
+        for (String m : FIN_TRANSACTION) if (t.contains(m)) return true;
+        return false;
+    }
+
+    /**
+     * Un ecran de MENU numerote n'est jamais une demande de code secret, meme
+     * s'il cite le mot. Le menu Airtel liste "6.Mon Compte/Mot de Passe" : sans
+     * ce test, le PIN etait tape a la place du choix de menu — le code secret
+     * partait dans un champ de menu et la sequence etait perdue.
+     */
+    private static boolean ressembleAUnMenu(String t) {
+        int options = 0;
+        java.util.regex.Matcher m =
+            java.util.regex.Pattern.compile("(?m)^\\s*\\d\\s*[.)\\-]\\s*\\S").matcher(t);
+        while (m.find()) options++;
+        return options >= 2;
+    }
+
+    private static boolean ressembleADemandeDePin(String texte) {
+        if (TextUtils.isEmpty(texte)) return false;
+        String t = texte.toLowerCase(Locale.ROOT);
+        if (ressembleAUnMenu(t)) return false;
+        for (String m : PIN_PROMPTS) if (t.contains(m)) return true;
+        return false;
+    }
+
+    /**
+     * Arme le service : le prochain dialogue USSD demandant une saisie recevra ce PIN.
+     * Appele juste AVANT l'envoi du code USSD.
+     */
+    public static void arm(String pin, String retraitId) {
+        arm(pin, "", 1, retraitId);
+    }
+
+    /**
+     * @param menuReply reponse a taper sur un ecran de saisie qui n'est PAS une
+     *                  demande de PIN (menu de confirmation). Vide = ne rien taper.
+     * @param maxSteps  nombre maximum d'ecrans de saisie a traiter.
+     *                  Orange Money en demande 2, MVola 1.
+     * @return false si un autre retrait est deja arme (refus, jamais d'ecrasement).
+     */
+    public static synchronized boolean arm(String pin, String menuReply,
+                                           int maxSteps, String retraitId) {
+        // ----------------------------------------------------------------
+        // GARDE-FOU ARGENT : ne JAMAIS ecraser un armement en cours.
+        // L'etat est statique et global ; armer le retrait B pendant que A est
+        // en cours ferait taper le PIN de B dans la boite de A, et attribuerait
+        // le texte de B au resultat de A.
+        // ----------------------------------------------------------------
+        if (isArmed() && armedRetraitId != null && !armedRetraitId.equals(retraitId)) {
+            Log.e(TAG, "REFUS d'armer " + retraitId + " : " + armedRetraitId + " est deja en cours");
+            return false;
+        }
+        nettoyerEcranAvantEnvoi();
+        armedPin       = (pin == null) ? null : pin.trim();
+        armedMenuReply = (menuReply == null) ? "" : menuReply.trim();
+        armedMaxSteps  = maxSteps < 1 ? 1 : maxSteps;
+        stepsDone      = 0;
+        menuReplyIndex = 0;
+        lastAttenteSignature = "";
+        lastFinalSignature = "";
+        lastHandledAt = 0L;
+        lastAttenteAt = 0L;
+        attenteClics = 0;
+        lastProgressAt = System.currentTimeMillis();
+        ecranNonTraite = "";
+        lastHandledSignature = "";
+        armedRetraitId = retraitId;
+        armedAt        = System.currentTimeMillis();
+        lastDialogText = "";
+        postSubmitText = "";
+        pinSubmitted   = false;
+        transactionInitiee = false;
+        transactionEchouee = false;
+        // Sans cette remise a zero, une consultation de solde anterieure laissait
+        // lectureFaite=true : estConclu() repondait vrai des la 1re sonde et le
+        // retrait etait conclu a 3 s, avant meme le premier ecran (0/7).
+        lectureFaite   = false;
+        Log.d(TAG, "arme pour retrait=" + retraitId + " (pin masque, "
+                + (armedPin == null ? 0 : armedPin.length()) + " chiffres, max "
+                + armedMaxSteps + " ecran(s))");
+        return true;
+    }
+
+    /** Nombre d'ecrans de saisie reellement remplis lors du dernier envoi. */
+    public static int getStepsDone() { return stepsDone; }
+
+    // ------------------------------------------------------------------
+    // HORODATAGE DE LA DERNIERE PROGRESSION REELLE.
+    // Un ecran rempli, un OK d'attente clique : c'est une progression.
+    // Le moteur s'en sert pour distinguer "l'operateur est lent" (il faut
+    // patienter) de "plus rien ne bouge" (il faut conclure). Sans cela, un
+    // delai fixe depuis le debut coupait la sequence en plein milieu quand
+    // l'operateur mettait 10 s par ecran, et les ecrans suivants n'etaient
+    // plus remplis du tout.
+    // ------------------------------------------------------------------
+    private static volatile long lastProgressAt = 0L;
+    public static long getLastProgressAt() { return lastProgressAt; }
+    private static void marquerProgression() { lastProgressAt = System.currentTimeMillis(); }
+
+    /** true si un ecran a confirme que le transfert etait parti chez l'operateur. */
+    public static boolean wasTransactionInitiee() { return transactionInitiee; }
+
+    /** true si l'operateur a annonce un echec definitif (solde insuffisant, etc.). */
+    public static boolean wasTransactionEchouee() { return transactionEchouee; }
+
+    /** true des qu'une conclusion est possible : plus la peine d'attendre. */
+    public static boolean estConclu() {
+        return transactionInitiee || transactionEchouee || lectureFaite;
+    }
+
+    /* ============================================================
+     * MODE LECTURE SEULE — consultation de solde.
+     * ------------------------------------------------------------
+     * Certains menus (MVola notamment) repondent par un ecran qui attend
+     * encore une saisie ("0:Hiverina, 00:Pejy voalohany"). L'API one-shot
+     * sendUssdRequest() considere alors la session comme echouee et ne rend
+     * AUCUN texte : le solde n'arrive jamais et l'affichage reste en
+     * chargement indefiniment.
+     *
+     * En mode lecture on compose le code, on LIT la boite, puis on la ferme.
+     * On ne saisit jamais rien : aucune transaction n'est en cours, il n'y a
+     * donc rien a valider par megarde.
+     * ============================================================ */
+    private static volatile boolean modeLecture  = false;
+    private static volatile boolean lectureFaite = false;
+    private static volatile String  texteLu      = "";
+
+    /** Arme une simple lecture d'ecran (consultation de solde). */
+    public static synchronized boolean armLecture(String reference) {
+        return armLecture(reference, "", 0);
+    }
+
+    // Multi-etape : menuReply = sequence "6|2|2011" tapee ecran par ecran AVANT
+    // la lecture du solde ; maxSteps = nombre d'ecrans a saisir. Vide/0 = lecture
+    // directe (solde des le 1er ecran, ex: MVola).
+    public static synchronized boolean armLecture(String reference, String menuReply, int maxSteps) {
+        if (isArmed() && armedRetraitId != null && !armedRetraitId.equals(reference)) {
+            Log.e(TAG, "REFUS de lecture " + reference + " : " + armedRetraitId + " en cours");
+            return false;
+        }
+        nettoyerEcranAvantEnvoi();
+        armedPin       = null;
+        armedMenuReply = (menuReply == null) ? "" : menuReply;
+        armedMaxSteps  = maxSteps;
+        stepsDone      = 0;
+        menuReplyIndex = 0;
+        lastAttenteSignature = "";
+        lastFinalSignature = "";
+        lastHandledAt = 0L;
+        lastAttenteAt = 0L;
+        attenteClics = 0;
+        lastProgressAt = System.currentTimeMillis();
+        ecranNonTraite = "";
+        lastHandledSignature = "";
+        armedRetraitId = reference;
+        armedAt        = System.currentTimeMillis();
+        lastDialogText = "";
+        postSubmitText = "";
+        pinSubmitted   = false;
+        transactionInitiee = false;
+        transactionEchouee = false;
+        modeLecture    = true;
+        lectureFaite   = false;
+        texteLu        = "";
+        Log.d(TAG, "arme en LECTURE pour " + reference);
+        return true;
+    }
+
+    public static boolean lectureTerminee() { return lectureFaite; }
+    public static String  getTexteLu()      { return texteLu; }
+
+    /** Texte du dernier ecran de saisie non reconnu (vide si tout s'est bien passe). */
+    public static String getEcranNonTraite() { return ecranNonTraite; }
+
+    /** Desarme immediatement (fin de transaction ou annulation). */
+    public static void disarm() {
+        modeLecture = false;
+        armedPin = null;
+        armedRetraitId = null;
+        armedAt = 0L;
+    }
+
+    /** true si le PIN a effectivement ete saisi et valide depuis le dernier arm(). */
+    public static boolean wasPinSubmitted() { return pinSubmitted; }
+
+    /** Dernier texte lu dans une boite de dialogue USSD (pour le compte rendu serveur). */
+    public static String getLastDialogText() { return lastDialogText; }
+
+    /** Texte le plus pertinent pour le serveur : celui d'APRES la saisie si on l'a. */
+    public static String getReportText() {
+        if (postSubmitText != null && !postSubmitText.trim().isEmpty()) return postSubmitText;
+        return lastDialogText;
+    }
+
+    /** true si l'utilisateur a active ce service dans les reglages d'accessibilite. */
     public static boolean isEnabled(Context ctx) {
         if (ctx == null) return false;
         try {
-            String on = Settings.Secure.getString(ctx.getContentResolver(), Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-            if (TextUtils.isEmpty(on)) return false;
-            String cible = ctx.getPackageName() + "/" + UssdReader.class.getName();
-            String court = ctx.getPackageName() + "/.UssdReader";
-            for (String p : on.split(":")) if (p.trim().equalsIgnoreCase(cible) || p.trim().equalsIgnoreCase(court)) return true;
-        } catch (Exception ignore) { }
+            String enabled = Settings.Secure.getString(ctx.getContentResolver(),
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+            if (TextUtils.isEmpty(enabled)) return false;
+            String target = ctx.getPackageName() + "/" + UssdReader.class.getName();
+            String shortTarget = ctx.getPackageName() + "/.UssdReader";
+            for (String part : enabled.split(":")) {
+                String p = part.trim();
+                if (p.equalsIgnoreCase(target) || p.equalsIgnoreCase(shortTarget)) return true;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "isEnabled: " + e.getMessage());
+        }
         return false;
     }
 
-    public static boolean estVivant(Context ctx) { return isEnabled(ctx) && INSTANCE != null; }
-
-    public static synchronized boolean armer(String ref, String menuSeq, int steps) {
-        if (estArme() && reference != null && !reference.equals(ref)) return false;
-        actif = true;
-        reference = ref;
-        menuReply = menuSeq == null ? "" : menuSeq;
-        maxSteps = steps;
-        menuReplyIndex = 0;
-        lectureFaite = false;
-        texteLu = "";
-        lastAttenteSignature = "";
-        lastHandledSignature = "";
-        attenteClics = 0;
-        armedAt = System.currentTimeMillis();
-        lastProgressAt = armedAt;
-        return true;
-    }
-
-    public static synchronized boolean armerRetrait(String ref, String pin, String menuSeq, int steps) {
-        if (estArme() && reference != null && !reference.equals(ref)) return false;
-        actif = true; modeRetrait = true; reference = ref;
-        armedPin = pin == null ? null : pin.trim();
-        menuReply = menuSeq == null ? "" : menuSeq;
-        maxSteps = steps < 1 ? 1 : steps;
-        menuReplyIndex = 0; stepsDone = 0;
-        pinSubmitted = false; transactionInitiee = false; transactionEchouee = false;
-        postSubmitText = ""; ecranNonTraite = "";
-        lectureFaite = false; texteLu = "";
-        lastAttenteSignature = ""; lastHandledSignature = ""; attenteClics = 0;
-        armedAt = System.currentTimeMillis(); lastProgressAt = armedAt;
-        return true;
-    }
-    public static boolean retraitPinSubmitted() { return pinSubmitted; }
-    public static boolean retraitInitiee() { return transactionInitiee; }
-    public static boolean retraitEchouee() { return transactionEchouee; }
-    public static int retraitSteps() { return stepsDone; }
-    public static String retraitTexte() { return postSubmitText != null && !postSubmitText.trim().isEmpty() ? postSubmitText : texteLu; }
-    public static String retraitEcranNonTraite() { return ecranNonTraite; }
-    public static boolean retraitConclu() { return transactionInitiee || transactionEchouee; }
-
-    public static void desarmer() { actif = false; modeRetrait = false; reference = null; armedAt = 0L; armedPin = null; }
-    public static boolean lectureTerminee() { return lectureFaite; }
-    public static String getTexteLu() { return texteLu; }
-    public static long getLastProgressAt() { return lastProgressAt; }
-
-    private static boolean estArme() {
-        if (!actif) return false;
-        if (System.currentTimeMillis() - armedAt >= ARM_TIMEOUT_MS) return false;
-        if (modeRetrait) return !(transactionInitiee || transactionEchouee);
-        return !lectureFaite;
-    }
-
-    @Override protected void onServiceConnected() { super.onServiceConnected(); INSTANCE = this; Log.d(TAG, "connecté"); }
-    @Override public boolean onUnbind(android.content.Intent i) { INSTANCE = null; return super.onUnbind(i); }
-    @Override public void onDestroy() { INSTANCE = null; super.onDestroy(); }
-    private void traiterRetrait(AccessibilityNodeInfo root, String text) {
-        try {
-            // échec définitif annoncé par l'opérateur
-            if (echecTerminal(text)) {
-                if (!transactionEchouee) { transactionEchouee = true; postSubmitText = text; fermer(300L, false); }
-                return;
-            }
-            // transfert déjà parti : on ferme par ANNULER
-            if (finTransaction(text)) {
-                if (!transactionInitiee) { transactionInitiee = true; postSubmitText = text; fermer(300L, true); }
-                return;
-            }
-            if (stepsDone >= maxSteps) return;
-            long now = System.currentTimeMillis();
-            if (now - lastActionAt < MIN_ACTION_INTERVAL_MS) return;
-            AccessibilityNodeInfo edit = findEditable(root);
-            if (edit == null) {
-                if (ecranTransitoire(text)) return;
-                if (ecranDattente(text) && peutCliquerAttente(text)) { lastActionAt = now; fermer(250L, false); }
-                return;
-            }
-            String sig = TextUtils.isEmpty(text) ? "<vide>" : text;
-            if (sig.equals(lastHandledSignature)) return;
-            boolean pin = demandePin(text);
-            boolean pinArme = armedPin != null && !armedPin.isEmpty();
-            final String value;
-            if (pin && pinArme) value = armedPin;
-            else if (!menuReply.isEmpty()) {
-                String[] rep = menuReply.split("\\|");
-                if (menuReplyIndex >= rep.length) return;
-                value = rep[menuReplyIndex];
-            } else {
-                if (ecranNonTraite.isEmpty()) ecranNonTraite = sig;
-                return;
-            }
-            if (value == null || value.isEmpty()) return;
-            lastActionAt = now;
-            final boolean utilisePin = pin && pinArme;
-            final String s2 = sig;
-            ecrireEtValider(value, () -> {
-                lastProgressAt = System.currentTimeMillis();
-                stepsDone++;
-                if (!utilisePin) menuReplyIndex++;
-                lastHandledSignature = s2;
-                if (pin) pinSubmitted = true;
-            });
-        } catch (Exception e) { Log.e(TAG, "traiterRetrait: " + e.getMessage()); }
-    }
-
-    @Override public void onInterrupt() { }
-
-    private static boolean contient(String t, String[] cles) {
-        if (TextUtils.isEmpty(t)) return false;
-        String b = t.toLowerCase(Locale.ROOT);
-        for (String c : cles) if (b.contains(c)) return true;
-        return false;
-    }
-    private static boolean ecranResultat(String t) { return contient(t, RESULTAT_MARKERS); }
-    private static boolean echecTerminal(String t) { return contient(t, ECHEC_TERMINAL); }
-    private static boolean finTransaction(String t) {
-        if (TextUtils.isEmpty(t)) return false;
-        String b = t.toLowerCase(Locale.ROOT);
-        for (String m : ECHEC_MALGRE_POSITIF) if (b.contains(m)) return false;
-        for (String m : FIN_TRANSACTION) if (b.contains(m)) return true;
-        return false;
-    }
-    private static boolean ressembleMenu(String t) {
-        int n = 0;
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(?m)^\\s*\\d\\s*[.)\\-]\\s*\\S").matcher(t);
-        while (m.find()) n++;
-        return n >= 2;
-    }
-    private static boolean demandePin(String t) {
-        if (TextUtils.isEmpty(t)) return false;
-        String b = t.toLowerCase(Locale.ROOT);
-        if (ressembleMenu(b)) return false;
-        for (String m : PIN_PROMPTS) if (b.contains(m)) return true;
-        return false;
-    }
-    private static boolean ecranTransitoire(String t) { return contient(t, ECRAN_TRANSITOIRE); }
-    private static boolean boiteParasite(String t) { return contient(t, BOITE_PARASITE); }
-    private static boolean ecranDattente(String t) {
-        if (TextUtils.isEmpty(t) || ecranResultat(t) || attenteClics >= ATTENTE_CLICS_MAX) return false;
-        return contient(t, ATTENTE_MARKERS);
-    }
-    private static boolean peutCliquerAttente(String t) {
-        long now = System.currentTimeMillis();
-        String sig = TextUtils.isEmpty(t) ? "<vide>" : t;
-        if (sig.equals(lastAttenteSignature) && now - lastAttenteAt < ATTENTE_REPEAT_MS) return false;
-        lastAttenteSignature = sig; lastAttenteAt = now; attenteClics++; lastProgressAt = now;
-        return true;
+    private static boolean isArmed() {
+        if ((System.currentTimeMillis() - armedAt) >= ARM_TIMEOUT_MS) return false;
+        if (modeLecture) return !lectureFaite;
+        return armedPin != null && !armedPin.isEmpty();
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
         if (event == null) return;
-        int type = event.getEventType();
-        if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) return;
-        AccessibilityNodeInfo root;
-        try { root = racineUssd(); } catch (Exception e) { return; }
-        if (root == null) return;
-        try {
-            if (!estBoiteUssd(root, event)) return;
-            String text = collecterTexte(root);
 
-            if (!estArme()) {
-                // Boîte orpheline : la fermer si elle n'attend pas de saisie
-                if (findEditable(root) == null && ecranDattente(text)) {
-                    fermer(400L, true);
+        final int type = event.getEventType();
+        if (type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                && type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) return;
+
+        AccessibilityNodeInfo root;
+        try {
+            root = racineUssd();
+        } catch (Exception e) {
+            return;
+        }
+        if (root == null) return;
+
+        try {
+            if (!looksLikeUssdDialog(root, event)) return;
+
+            String text = collectText(root);
+            if (!TextUtils.isEmpty(text)) {
+                lastDialogText = text;
+                // Ecran vu APRES la validation : c'est celui qui dit reellement
+                // ce qu'a repondu l'operateur.
+                if (pinSubmitted) postSubmitText = text;
+            }
+
+            // ----------------------------------------------------------------
+            // MENU D'OFFRES : ferme des qu'il apparait, quoi qu'il arrive.
+            //
+            // L'operateur le pousse de lui-meme, sans qu'on ait rien demande.
+            // Laisse a l'ecran, il bloque la boite suivante ; et s'il surgit au
+            // milieu d'une operation, le chiffre tape dedans achete un forfait.
+            // La passerelle n'achete jamais rien : on annule, sans condition et
+            // sans regarder si une operation est en cours.
+            //
+            // Seul ANNULER est utilise : le bouton d'envoi validerait l'achat.
+            // ----------------------------------------------------------------
+            if (menuOffresSeul(text)) {
+                long maintenant = System.currentTimeMillis();
+                if (maintenant - dernierRefusOffre > 3000L) {
+                    dernierRefusOffre = maintenant;
+                    Log.e(TAG, "menu d'offres detecte -> ANNULER (operation en cours : " + isArmed() + ")");
+                    final AccessibilityNodeInfo rOf = root;
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                        try {
+                            AccessibilityNodeInfo rx = racineUssd();
+                            if (rx == null) rx = rOf;
+                            if (rx != null && !clickCancelButton(rx)) clickDismissButton(rx);
+                        } catch (Exception e) {
+                            Log.e(TAG, "fermeture menu d'offres (evenement): " + e.getMessage());
+                        }
+                    }, 200L);
                 }
                 return;
             }
 
-            // ===== MODE RETRAIT =====
-            if (modeRetrait) { traiterRetrait(root, text); return; }
-
-            // Menu parasite (offre / forfait) : ANNULER, lecture sans solde
-            if (!lectureFaite && boiteParasite(text)) {
-                texteLu = ""; lectureFaite = true; lastActionAt = System.currentTimeMillis();
-                Log.d(TAG, "menu parasite -> ANNULER");
-                fermer(250L, true);
-                return;
-            }
-
-            // Séquence multi-étape à taper avant lecture
-            if (!menuReply.isEmpty()) {
-                String[] rep = menuReply.split("\\|");
-                if (menuReplyIndex < rep.length) {
-                    long now = System.currentTimeMillis();
-                    if (now - lastActionAt < MIN_ACTION_INTERVAL_MS) return;
-                    AccessibilityNodeInfo edit = findEditable(root);
-                    if (edit == null) {
-                        if (ecranDattente(text) && peutCliquerAttente(text)) { lastActionAt = now; fermer(250L, false); }
+            if (!isArmed()) {
+                // ------------------------------------------------------------
+                // BALAYAGE : boite USSD restee ouverte alors qu'aucune operation
+                // n'est en cours (fin de session Telma/Orange, "Merci d'avoir
+                // utiliser ce service", resultat arrive apres le desarmement...).
+                // Non fermees, elles S'EMPILENT — dix boites superposees vues sur
+                // Telma — et la suivante s'ouvre derriere, hors de portee.
+                // On ne ferme QUE les boites SANS champ de saisie : une boite qui
+                // attend une reponse n'est jamais touchee hors operation armee.
+                // ------------------------------------------------------------
+                try {
+                    // Menu operateur reste ouvert apres une lecture qui n'a pas
+                    // abouti. Il A un champ de saisie, donc la regle ci-dessus ne
+                    // le fermait pas : les boites s'empilaient (cinq vues sur
+                    // Airtel) et plus rien ne pouvait etre saisi. Hors operation
+                    // armee, ce menu ne sert a rien : on l'annule.
+                    if (findEditable(root) != null && boiteParasite(text)) {
+                        Log.d(TAG, "menu operateur orphelin -> fermeture par ANNULER");
+                        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                            try {
+                                AccessibilityNodeInfo rP = racineUssd();
+                                if (rP != null && !clickCancelButton(rP)) clickDismissButton(rP);
+                            } catch (Exception e) {
+                                Log.e(TAG, "fermeture menu orphelin: " + e.getMessage());
+                            }
+                        }, 400L);
                         return;
                     }
-                    String sig = TextUtils.isEmpty(text) ? "<vide>" : text;
-                    if (sig.equals(lastHandledSignature)) return;
-                    lastActionAt = now;
-                    final String v = rep[menuReplyIndex], s2 = sig;
-                    ecrireEtValider(v, () -> { lastProgressAt = System.currentTimeMillis(); menuReplyIndex++; lastHandledSignature = s2; });
-                    return;
-                }
+                    if (findEditable(root) == null && peutCliquerAttente(text)) {
+                        Log.d(TAG, "boite USSD orpheline -> fermeture");
+                        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                            try {
+                                AccessibilityNodeInfo rO = racineUssd();
+                                if (rO != null) clickDismissButton(rO);
+                            } catch (Exception e) {
+                                Log.e(TAG, "fermeture orpheline: " + e.getMessage());
+                            }
+                        }, 400L);
+                    }
+                } catch (Exception e) { /* le balayage ne doit rien casser */ }
+                return;
             }
 
-            // Lecture du solde
-            if (!TextUtils.isEmpty(text) && !lectureFaite) {
-                if (ecranTransitoire(text)) return;
-                if (ecranDattente(text)) {
-                    if (peutCliquerAttente(text)) { lastActionAt = System.currentTimeMillis(); fermer(250L, false); }
+            // ----------------------------------------------------------------
+            // MODE LECTURE : relever le texte affiche puis fermer la boite.
+            // Aucune saisie, quel que soit le contenu de l'ecran.
+            // ----------------------------------------------------------------
+            if (modeLecture) {
+                // Menu d'offres insere par l'operateur au milieu d'une
+                // consultation. On le verifie AVANT toute saisie : la sequence
+                // tape ses chiffres sur chaque ecran de saisie, et dans ce menu
+                // un chiffre choisit une offre payante. On annule et on termine
+                // la lecture sans solde — mieux vaut aucun solde qu'un faux.
+                // ANNULER uniquement : le bouton d'envoi validerait un choix.
+                // menuOffresSeul, pas boiteParasite : la sequence de consultation
+                // traverse le menu principal, qui contient « achat recharge et
+                // offre » — l'annuler tuerait la lecture en cours.
+                if (!lectureFaite && menuOffresSeul(text)) {
+                    texteLu        = "";
+                    ecranNonTraite = text;
+                    lectureFaite   = true;
+                    lastActionAt   = System.currentTimeMillis();
+                    Log.d(TAG, "lecture: menu d'offres -> ANNULER, aucun solde releve");
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                        try {
+                            AccessibilityNodeInfo rX = racineUssd();
+                            if (rX != null) clickCancelButton(rX);
+                        } catch (Exception e) {
+                            Log.e(TAG, "fermeture menu d'offres: " + e.getMessage());
+                        }
+                    }, 250L);
                     return;
                 }
-                texteLu = text; lectureFaite = true;
-                Log.d(TAG, "solde lu");
-                fermer(300L, true);
+                // Multi-etape : tant que la sequence (armedMenuReply="6|2|2011")
+                // n'est pas epuisee, on tape POSITIONNELLEMENT la reponse courante
+                // sur chaque ecran de saisie. Le solde n'est lu qu'ensuite.
+                if (!armedMenuReply.isEmpty()) {
+                    String[] _repL = armedMenuReply.split("\\|");
+                    if (menuReplyIndex < _repL.length) {
+                        long nowL = System.currentTimeMillis();
+                        if (nowL - lastActionAt < MIN_ACTION_INTERVAL_MS) return;
+                        AccessibilityNodeInfo editL = findEditable(root);
+                        if (editL == null) {
+                            // Ecran d'attente Airtel ("tsindrio ny ok") : le valider
+                            // pour que le menu suivant s'affiche. Aucune reponse de
+                            // la sequence n'est consommee ici.
+                            if (ecranDattente(text)) {
+                                if (!peutCliquerAttente(text)) return;
+                                lastActionAt = nowL;
+                                Log.d(TAG, "lecture: ecran d'attente -> clic OK");
+                                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                                    try {
+                                        AccessibilityNodeInfo rW = racineUssd();
+                                        if (rW != null) clickSendButton(rW);
+                                    } catch (Exception e) {
+                                        Log.e(TAG, "clic OK attente (lecture): " + e.getMessage());
+                                    }
+                                }, 250L);
+                            }
+                            return;                       // ecran sans saisie : patienter
+                        }
+                        String sigL = TextUtils.isEmpty(text) ? "<vide>" : text;
+                        if (sigL.equals(lastHandledSignature)) return;
+                        String valL = _repL[menuReplyIndex];
+                        lastActionAt = nowL;
+                        final String sigL2 = sigL;
+                        // Meme ecriture VERIFIEE que pour un retrait : sans elle,
+                        // un ecran encore en cours d'affichage recevait un envoi
+                        // a vide et la consultation restait bloquee.
+                        ecrireEtValider(valL, 0, () -> {
+                            marquerProgression();
+                            menuReplyIndex++;
+                            lastHandledSignature = sigL2;
+                            lastHandledAt = System.currentTimeMillis();
+                            Log.d(TAG, "lecture: ecran menu valide (" + menuReplyIndex
+                                    + "/" + _repL.length + ")");
+                        });
+                        return;                               // pas encore la lecture
+                    }
+                }
+                if (!TextUtils.isEmpty(text) && !lectureFaite) {
+                    // Un ecran d'attente n'est PAS le solde : le prendre pour tel
+                    // enregistrerait "Eo ampanatontosana ny fangatahana" comme
+                    // montant. On le valide et on attend le vrai resultat.
+                    if (ecranDattente(text)) {
+                        if (!peutCliquerAttente(text)) return;
+                        lastActionAt = System.currentTimeMillis();
+                        Log.d(TAG, "lecture: attente avant resultat -> clic OK");
+                        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                            try {
+                                AccessibilityNodeInfo rF = racineUssd();
+                                if (rF != null) clickSendButton(rF);
+                            } catch (Exception e) {
+                                Log.e(TAG, "clic OK attente finale: " + e.getMessage());
+                            }
+                        }, 250L);
+                        return;
+                    }
+                    texteLu      = text;
+                    lectureFaite = true;
+                    Log.d(TAG, "lecture solde effectuee pour " + armedRetraitId);
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                        try {
+                            AccessibilityNodeInfo r5 = racineUssd();
+                            // La boite de resultat ("Ny toe bolanao dia Ar ...
+                            // Trans ID: ...") n'a qu'un bouton OK. clickDismissButton
+                            // essaie button1 (OK) en premier ; si rien n'est
+                            // trouve, on retente explicitement le bouton positif.
+                            // Sans cette fermeture, la boite reste a l'ecran et la
+                            // consultation suivante s'ouvre derriere elle.
+                            if (r5 != null && !clickDismissButton(r5)) {
+                                clickSendButton(r5);
+                            }
+                        } catch (Exception e) {
+                            Log.e(TAG, "fermeture lecture: " + e.getMessage());
+                        }
+                    }, 300L);
+                    // Deuxieme passage : sur certains telephones le premier clic
+                    // arrive avant que la boite soit pleinement affichee.
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                        try {
+                            AccessibilityNodeInfo r7 = racineUssd();
+                            if (r7 != null && looksLikeUssdDialog(r7, null)
+                                    && findEditable(r7) == null) {
+                                Log.d(TAG, "boite de solde encore ouverte -> second clic OK");
+                                if (!clickDismissButton(r7)) clickSendButton(r7);
+                            }
+                        } catch (Exception e) { /* second essai facultatif */ }
+                    }, 1200L);
+                }
+                return;
             }
-        } catch (Exception e) { Log.e(TAG, "event: " + e.getMessage()); }
+
+            // ----------------------------------------------------------------
+            // PRIORITE 1 : l'ecran annonce que le transfert est DEJA PARTI.
+            // Cas Orange Money : "Transfert initie. Vous allez recevoir une
+            // confirmation par SMS. 1: enregistrer le numero ... 2: ne pas ..."
+            // Cet ecran a un champ de saisie, mais repondre n'a AUCUN effet sur
+            // l'argent : la transaction est close. On ferme par ANNULER pour
+            // liberer la SIM et enchainer immediatement le retrait suivant.
+            // Ce test passe AVANT la logique de saisie, sinon on tomberait dans
+            // "ecran non reconnu" et le retrait serait declare en echec alors
+            // que le client a bien recu son argent.
+            // ----------------------------------------------------------------
+            // ----------------------------------------------------------------
+            // PRIORITE 0 : echec definitif annonce par l'operateur.
+            // Cette boite n'a PAS de champ de saisie (bouton OK seul) : sans ce
+            // traitement, le service n'y touchait pas, elle restait affichee, et
+            // on attendait le delai complet avant de conclure. On la ferme et on
+            // conclut tout de suite : le retrait suivant peut demarrer.
+            // ----------------------------------------------------------------
+            if (echecTerminal(text)) {
+                if (!transactionEchouee) {
+                    transactionEchouee = true;
+                    postSubmitText = text;
+                    Log.d(TAG, "echec operateur pour retrait=" + armedRetraitId
+                            + " -> fermeture de la boite");
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                        try {
+                            AccessibilityNodeInfo r4 = racineUssd();
+                            if (r4 != null && !clickDismissButton(r4)) {
+                                Log.d(TAG, "bouton de fermeture introuvable, la boite se fermera seule");
+                            }
+                        } catch (Exception e) {
+                            Log.e(TAG, "clic fermeture: " + e.getMessage());
+                        }
+                    }, 300L);
+                }
+                return;
+            }
+
+            if (transactionDejaPartie(text)) {
+                if (!transactionInitiee) {
+                    transactionInitiee = true;
+                    postSubmitText = text;
+                    Log.d(TAG, "transfert parti chez l'operateur pour retrait=" + armedRetraitId
+                            + " -> fermeture par ANNULER");
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                        try {
+                            AccessibilityNodeInfo r3 = racineUssd();
+                            if (r3 != null && !clickCancelButton(r3)) {
+                                Log.d(TAG, "bouton ANNULER introuvable, la boite se fermera seule");
+                            }
+                        } catch (Exception e) {
+                            Log.e(TAG, "clic annuler: " + e.getMessage());
+                        }
+                    }, 300L);
+                }
+                return;
+            }
+
+            if (stepsDone >= armedMaxSteps) return;   // quota d'ecrans atteint
+
+            long now = System.currentTimeMillis();
+            if (now - lastActionAt < MIN_ACTION_INTERVAL_MS) return;
+
+            // GARDE-FOU ARGENT : menu d'offres de l'operateur.
+            //
+            // Il surgit au milieu d'une session et possede un champ de saisie.
+            // Le chiffre suivant de la sequence y serait tape comme ailleurs —
+            // sauf qu'ici un chiffre achete un forfait : la caisse paie une
+            // offre a la place du client. On annule et on echoue proprement ;
+            // un retrait a relancer coute moins cher qu'un forfait achete.
+            // menuOffresSeul : le retrait multi-etape passe par le menu principal,
+            // ou figure « achat recharge et offre ». Le fermer ferait echouer un
+            // retrait parfaitement valide.
+            if (menuOffresSeul(text)) {
+                Log.e(TAG, "menu d'offres pendant un retrait -> ANNULER, aucune saisie");
+                ecranNonTraite    = text;
+                transactionEchouee = true;
+                lastActionAt      = System.currentTimeMillis();
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    try {
+                        AccessibilityNodeInfo rO = racineUssd();
+                        // ANNULER seulement : le bouton d'envoi validerait l'achat.
+                        if (rO != null) clickCancelButton(rO);
+                    } catch (Exception e) {
+                        Log.e(TAG, "fermeture menu d'offres (retrait): " + e.getMessage());
+                    }
+                }, 250L);
+                return;
+            }
+
+            AccessibilityNodeInfo input = findEditable(root);
+            if (input == null) {
+                // Boite SANS saisie : soit un ecran d'attente ("tsindrio ny ok"),
+                // qu'il faut valider pour que la session continue, soit un ecran
+                // FINAL (resultat, ou erreur du type "Probleme de connexion ou
+                // code IHM non valide"). Dans les deux cas il faut cliquer OK :
+                // le texte a deja ete capture dans lastDialogText, et une boite
+                // laissee ouverte bloque la suivante derriere elle.
+                if (ecranDattente(text)) {
+                    if (!peutCliquerAttente(text)) return;   // clic deja emis a l'instant
+                    lastActionAt = System.currentTimeMillis();
+                    Log.d(TAG, "ecran d'attente operateur -> clic OK (aucune etape consommee)");
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                        try {
+                            AccessibilityNodeInfo rA = racineUssd();
+                            if (rA != null) clickSendButton(rA);
+                        } catch (Exception e) {
+                            Log.e(TAG, "clic OK attente: " + e.getMessage());
+                        }
+                    }, 250L);
+                } else if (!TextUtils.isEmpty(text)) {
+                    // Boite de progression du systeme : la reponse de l'operateur
+                    // n'est pas encore arrivee. La fermer annulerait la session
+                    // avant meme le premier menu (constate sur Airtel *436#).
+                    if (ecranTransitoire(text)) return;
+                    // Ecran terminal : resultat ou erreur operateur. On le ferme
+                    // pour liberer l'ecran. Le moteur conclura de son cote a
+                    // partir du texte deja lu.
+                    String sigT = text;
+                    if (sigT.equals(lastFinalSignature)) return;
+                    lastFinalSignature = sigT;
+                    Log.d(TAG, "ecran terminal USSD -> fermeture par OK");
+                    new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                        try {
+                            AccessibilityNodeInfo rT = racineUssd();
+                            if (rT != null && findEditable(rT) == null) {
+                                if (!clickDismissButton(rT)) clickSendButton(rT);
+                            }
+                        } catch (Exception e) {
+                            Log.e(TAG, "fermeture ecran terminal: " + e.getMessage());
+                        }
+                    }, 900L);
+                }
+                return;                             // rien d'autre a faire ici
+            }
+
+            // ----------------------------------------------------------------
+            // Ne JAMAIS repondre deux fois au meme ecran.
+            // Orange Money demande DEUX saisies successives : sans cette garde,
+            // un evenement redondant consommerait la seconde etape sur le
+            // premier ecran, et la vraie seconde boite resterait sans reponse.
+            // ----------------------------------------------------------------
+            String signature = TextUtils.isEmpty(text) ? "<vide>" : text;
+            if (signature.equals(lastHandledSignature)) return;
+
+            // ----------------------------------------------------------------
+            // CHOIX DE LA VALEUR — pilote par le CONTENU de l'ecran, jamais par
+            // un simple compteur. Le PIN n'est tape que sur un ecran qui demande
+            // effectivement le code secret ; tout autre ecran de saisie recoit
+            // la reponse de menu configuree. Ainsi, meme si l'ordre des ecrans
+            // change chez l'operateur, le PIN ne part jamais dans un champ de menu.
+            // ----------------------------------------------------------------
+            final boolean demandePin = ressembleADemandeDePin(text);
+            // Un PIN separe n'existe que pour Orange. Sur Airtel, le code secret
+            // est une ETAPE de la sequence ({pin} en etape 7) : armedPin est vide.
+            // Sans ce controle, l'ecran "Code secret" recevait armedPin vide, rien
+            // n'etait tape, et le retrait restait fige sur cet ecran.
+            final boolean pinSepareArme = armedPin != null && !armedPin.isEmpty();
+            final boolean utilisePinArme = demandePin && pinSepareArme;
+            final String value;
+            if (utilisePinArme) {
+                value = armedPin;
+            } else if (!armedMenuReply.isEmpty()) {
+                // Multi-etape : armedMenuReply peut contenir une SEQUENCE separee
+                // par '|' (ex: "2|1|1|033...|10000|2|1234"). On tape l'element
+                // courant ; l'index avance apres chaque ecran valide.
+                String[] _rep = armedMenuReply.split("\\|");
+                if (menuReplyIndex >= _rep.length) return; // sequence epuisee
+                value = _rep[menuReplyIndex];
+            } else {
+                // Ecran de saisie inconnu et aucune reponse configuree : on ne
+                // tape RIEN. On memorise le texte pour que l'admin voie
+                // exactement quoi configurer, plutot que d'envoyer au hasard.
+                if (ecranNonTraite.isEmpty()) {
+                    ecranNonTraite = signature;
+                    Log.e(TAG, "ecran de saisie non reconnu, aucune reponse configuree");
+                }
+                return;
+            }
+            if (value == null || value.isEmpty()) return;
+
+            lastActionAt = now;
+            final String sig = signature;
+
+            // Ecriture VERIFIEE puis validation. Le compteur d'ecrans n'avance
+            // que si le clic a reellement eu lieu : un ecran non rempli n'est
+            // jamais compte comme fait.
+            ecrireEtValider(value, 0, () -> {
+                marquerProgression();
+                stepsDone++;
+                // L'index avance des que la valeur vient de la SEQUENCE
+                // (y compris quand c'est l'etape {pin} d'Airtel), jamais
+                // quand c'est le PIN separe d'Orange.
+                if (!utilisePinArme) menuReplyIndex++;
+                lastHandledSignature = sig;
+                lastHandledAt = System.currentTimeMillis();
+                // Le code secret a bien ete saisi, qu'il vienne du champ
+                // PIN separe ou de l'etape correspondante de la sequence.
+                if (demandePin) pinSubmitted = true;
+                Log.d(TAG, "ecran " + stepsDone + "/" + armedMaxSteps
+                        + " valide pour retrait=" + armedRetraitId
+                        + (demandePin ? " [PIN]" : " [menu]"));
+            });
+
+        } catch (Exception e) {
+            Log.e(TAG, "onAccessibilityEvent: " + e.getMessage());
+        }
     }
 
-    private void fermer(long delai, boolean annulerDabord) {
+    @Override
+    public void onInterrupt() { /* rien */ }
+
+    // ------------------------------------------------------------------
+    // Instance REELLEMENT connectee.
+    //
+    // isEnabled() ne lit que le reglage Android : apres une mise a jour de
+    // l'APK, le service reste coche mais n'est plus lie. La passerelle croyait
+    // pouvoir saisir les codes USSD, composait, puis expirait sans qu'aucun
+    // ecran ne soit vu — retraits en echec silencieux. On verifie donc aussi
+    // qu'une instance vivante existe.
+    // ------------------------------------------------------------------
+    private static volatile UssdReader INSTANCE = null;
+
+    @Override
+    protected void onServiceConnected() {
+        super.onServiceConnected();
+        INSTANCE = this;
+        Log.d(TAG, "service d'accessibilite connecte");
+        // Au reveil, l'ecran peut porter une boite laissee par la session
+        // precedente — menu d'offres pousse par l'operateur, ou USSD interrompu
+        // quand le telephone s'est endormi. Personne ne la fermait : aucune
+        // operation n'etait en cours, donc aucun evenement ne survenait. On
+        // regarde donc une fois, deux secondes apres la connexion, le temps que
+        // le systeme ait fini d'afficher ce qu'il avait a afficher.
+        new Handler(Looper.getMainLooper()).postDelayed(
+            UssdReader::balayerEcranAuReveil, 2000L);
+    }
+
+    /**
+     * Balayage unique au reveil : ferme ce qui traine, sans jamais toucher a une
+     * operation en cours.
+     *
+     * Deux cas seulement — un menu d'offres, qui n'a rien a faire la ; et une
+     * boite USSD orpheline, c'est-a-dire alors qu'aucun ordre n'est arme. Tout
+     * le reste est laisse tel quel.
+     */
+    private static void balayerEcranAuReveil() {
+        final UssdReader svc = INSTANCE;
+        if (svc == null) return;
+        try {
+            AccessibilityNodeInfo root = svc.racineUssd();
+            if (root == null) return;                 // ecran deja propre
+            String texte = svc.collectText(root);
+
+            if (menuOffresSeul(texte)) {
+                Log.e(TAG, "reveil : menu d'offres restant -> ANNULER");
+                if (!svc.clickCancelButton(root)) svc.clickDismissButton(root);
+                return;
+            }
+            // Boite orpheline : aucune operation armee, donc rien a interrompre.
+            if (!isArmed() && containsUssdMarker(texte)) {
+                Log.e(TAG, "reveil : boite USSD orpheline -> fermeture");
+                if (!svc.clickCancelButton(root)) svc.clickDismissButton(root);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "balayerEcranAuReveil: " + e.getMessage());
+        }
+    }
+
+    @Override
+    public boolean onUnbind(android.content.Intent intent) {
+        INSTANCE = null;
+        Log.d(TAG, "service d'accessibilite deconnecte");
+        return super.onUnbind(intent);
+    }
+
+    @Override
+    public void onDestroy() {
+        INSTANCE = null;
+        super.onDestroy();
+    }
+
+    /**
+     * Ferme une boite USSD ABANDONNEE avant de composer.
+     *
+     * onAccessibilityEvent n'est appele que sur un CHANGEMENT d'ecran : une
+     * boite ouverte depuis longtemps n'emet plus rien et restait invisible pour
+     * la passerelle, qui composait dans le vide puis expirait. getRootInActive-
+     * Window, lui, lit l'ecran tel qu'il est maintenant.
+     *
+     * Quatre conditions, pour ne jamais couper une session vivante :
+     *   1. une instance du service est connectee ;
+     *   2. une boite USSD est bien a l'ecran ;
+     *   3. plus rien n'a bouge depuis INACTIF_MIN_MS (session morte) ;
+     *   4. aucun texte n'a ete saisi dans le champ (personne n'attend d'envoi).
+     * On clique ANNULER : aucun caractere n'est tape, donc aucun mouvement
+     * d'argent possible.
+     */
+    private static final long INACTIF_MIN_MS = 90_000L;
+
+    /** Nombre maximum de balayages : au-dela, l'ecran ne repond pas et
+     *  s'acharner ne changerait rien. Vingt passes de 600 ms = douze secondes. */
+    private static final int PARASITE_PASSES_MAX = 20;
+
+    /**
+     * Ferme les menus parasites restants, un par passe, jusqu'a ce que l'ecran
+     * soit propre. Sans Thread.sleep : on repasse par le Handler, le thread
+     * principal reste libre entre deux fermetures.
+     */
+    private static void fermerParasitesEnBoucle(final int passe) {
+        if (passe >= PARASITE_PASSES_MAX) {
+            Log.e(TAG, "menu d'offres toujours present apres " + passe + " passes");
+            return;
+        }
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
             try {
-                AccessibilityNodeInfo r = racineUssd();
-                if (r == null) return;
-                if (annulerDabord) { if (!clic(r, CANCEL_LABELS, "android:id/button2") && !clic(r, SEND_LABELS, "android:id/button1")) { } }
-                else clic(r, SEND_LABELS, "android:id/button1");
-            } catch (Exception ignore) { }
-        }, delai);
-    }
-
-    // ---- utilitaires ----
-    private AccessibilityNodeInfo racineUssd() {
-        try { AccessibilityNodeInfo a = getRootInActiveWindow(); if (a != null && estBoiteUssd(a, null)) return a; } catch (Exception ignore) { }
-        try {
-            List<AccessibilityWindowInfo> ws = getWindows();
-            if (ws != null) for (AccessibilityWindowInfo w : ws) {
-                if (w == null) continue;
-                AccessibilityNodeInfo r = null;
-                try { r = w.getRoot(); } catch (Exception ignore) { }
-                if (r != null && estBoiteUssd(r, null)) return r;
+                final UssdReader svc = INSTANCE;
+                if (svc == null) return;
+                AccessibilityNodeInfo r = svc.racineUssd();
+                if (r == null) return;                    // ecran propre
+                if (!boiteParasite(svc.collectText(r))) return;   // plus de menu
+                Log.e(TAG, "menu d'offres encore la (passe " + (passe + 1) + ") -> ANNULER");
+                if (!svc.clickCancelButton(r)) svc.clickDismissButton(r);
+                fermerParasitesEnBoucle(passe + 1);
+            } catch (Exception e) {
+                Log.e(TAG, "fermerParasitesEnBoucle: " + e.getMessage());
             }
-        } catch (Exception ignore) { }
-        try { return getRootInActiveWindow(); } catch (Exception e) { return null; }
+        }, 600L);
     }
 
-    private boolean estBoiteUssd(AccessibilityNodeInfo root, AccessibilityEvent event) {
-        CharSequence pkgCs = root.getPackageName() != null ? root.getPackageName() : (event != null ? event.getPackageName() : null);
-        String pkg = pkgCs == null ? "" : pkgCs.toString().toLowerCase(Locale.ROOT);
-        if (pkg.startsWith("mg.kajypay")) return false;
-        if (pkg.contains("dialer") || pkg.contains("incallui") || pkg.contains("telecom") || pkg.contains("phone")) return true;
-        CharSequence cls = event != null ? event.getClassName() : null;
-        if (cls != null && cls.toString().toLowerCase(Locale.ROOT).contains("alertdialog")) return findEditable(root) != null;
+    private static void nettoyerEcranAvantEnvoi() {
+        final UssdReader svc = INSTANCE;
+        if (svc == null) return;                       // 1
+        try {
+            AccessibilityNodeInfo root = svc.racineUssd();
+            if (root == null) return;                  // 2
+
+            // Le menu d'offres se ferme SANS CONDITION, avant toute protection.
+            // Les gardes ci-dessous existent pour ne pas interrompre une session
+            // en cours ou une saisie ; ce menu, lui, n'a aucune raison d'etre la
+            // et un chiffre tape dedans achete un forfait. On l'annule, meme si
+            // l'ecran vient de bouger, meme si le champ contient deja du texte.
+            // On ferme le premier tout de suite, puis on relance un balayage en
+            // differe tant qu'il en reste : plusieurs menus peuvent s'etre
+            // empiles. Le nettoyage tourne sur le thread principal — une boucle
+            // avec Thread.sleep le figerait et Android declarerait l'application
+            // bloquee. D'ou le report par Handler, qui laisse la main entre deux
+            // fermetures.
+            if (boiteParasite(svc.collectText(root))) {
+                Log.e(TAG, "menu d'offres present -> ANNULER sans condition");
+                if (!svc.clickCancelButton(root)) svc.clickDismissButton(root);
+                fermerParasitesEnBoucle(0);
+                return;
+            }
+
+            long inactif = System.currentTimeMillis() - lastProgressAt;
+            if (lastProgressAt > 0 && inactif < INACTIF_MIN_MS) return;   // 3
+
+            AccessibilityNodeInfo ed = svc.findEditable(root);
+            if (ed != null && ed.getText() != null && ed.getText().length() > 0) return;  // 4
+
+            Log.d(TAG, "boite USSD abandonnee (" + (inactif / 1000) + " s) -> ANNULER avant envoi");
+            if (!svc.clickCancelButton(root)) svc.clickDismissButton(root);
+            try { Thread.sleep(600); } catch (InterruptedException ignored) { }
+        } catch (Exception e) {
+            Log.e(TAG, "nettoyage avant envoi: " + e.getMessage());
+        }
+    }
+
+    /** Reglage actif ET service reellement lie au systeme. */
+    public static boolean estVivant(Context ctx) {
+        return isEnabled(ctx) && INSTANCE != null;
+    }
+
+    // ------------------------------------------------------------------
+    // Detection de la boite de dialogue USSD
+    // ------------------------------------------------------------------
+
+    /** Paquets qui affichent les boites USSD/MMI selon les constructeurs. */
+    private static final String[] PHONE_PACKAGES = {
+            "com.android.phone",
+            "com.android.server.telecom",
+            "com.google.android.dialer",
+            "com.samsung.android.dialer",
+            "com.samsung.android.incallui",
+            "com.android.incallui",
+            "com.miui.securitycenter",
+            "com.android.dialer",
+            "com.transsion.phonemanager",
+            "com.oppo.phone",
+            "com.coloros.phonemanager",
+            "com.huawei.systemmanager"
+    };
+
+    /**
+     * Marqueurs de contenu propres aux menus USSD Mobile Money (mg / fr / en).
+     * Garde-fou : on ne saisit JAMAIS le PIN dans une fenetre quelconque, meme
+     * si le paquet emetteur est inconnu.
+     */
+    private static final String[] USSD_TEXT_MARKERS = {
+            "kaody miafina", "ampidiro",
+            "pejy voalohany", "hiverina",
+            "sarany", "handefa vola",
+            "code secret", "code pin", "votre pin",
+            "mot de passe", "transfert",
+            "enter your pin", "enter pin"
+    };
+
+    private static boolean containsUssdMarker(String texte) {
+        if (TextUtils.isEmpty(texte)) return false;
+        String t = texte.toLowerCase(Locale.ROOT);
+        for (String m : USSD_TEXT_MARKERS) if (t.contains(m)) return true;
         return false;
     }
 
-    private String collecterTexte(AccessibilityNodeInfo node) { StringBuilder sb = new StringBuilder(); collecter(node, sb, 0); return sb.toString().trim(); }
-    private void collecter(AccessibilityNodeInfo n, StringBuilder sb, int d) {
-        if (n == null || d > 25) return;
-        try {
-            CharSequence t = n.getText();
-            if (!estEditable(n) && t != null && t.length() > 0) {
-                String s = t.toString().trim();
-                if (!s.isEmpty() && sb.indexOf(s) < 0) { if (sb.length() > 0) sb.append(" | "); sb.append(s); }
-            }
-            for (int i = 0; i < n.getChildCount(); i++) collecter(n.getChild(i), sb, d + 1);
-        } catch (Exception ignore) { }
+    private boolean looksLikeUssdDialog(AccessibilityNodeInfo root, AccessibilityEvent event) {
+        // 1) Paquet emetteur connu.
+        //    Comparaison "contient" et non "egal" : les ROM constructeurs ajoutent
+        //    des suffixes (com.android.phone.xxx, com.transsion.phone...) et la
+        //    comparaison stricte faisait echouer la detection -> aucune saisie.
+        CharSequence pkgCs = root.getPackageName() != null ? root.getPackageName()
+                : (event != null ? event.getPackageName() : null);
+        String pkg = pkgCs == null ? "" : pkgCs.toString().toLowerCase(Locale.ROOT);
+
+        // GARDE ABSOLUE : notre propre application n'est JAMAIS une boite USSD.
+        // Son ecran Parametres contient des champs de saisie (codes USSD, PIN,
+        // URL du serveur) ; sans ce controle, une reponse de menu — ou pire le
+        // code secret — pourrait y etre ecrite au lieu de partir a l'operateur.
+        if (pkg.startsWith("mg.kajypay")) return false;
+
+        for (String p : PHONE_PACKAGES) {
+            if (pkg.equals(p) || pkg.startsWith(p)) return true;
+        }
+        if (pkg.contains("dialer") || pkg.contains("incallui")
+                || pkg.contains("telecom") || pkg.contains("phone")) return true;
+
+        // 2) Repli : dialogue systeme avec champ de saisie
+        CharSequence cls = event != null ? event.getClassName() : null;
+        if (cls != null && cls.toString().toLowerCase(Locale.ROOT).contains("alertdialog")) {
+            return findEditable(root) != null;
+        }
+
+        // 3) Dernier repli, volontairement restrictif : fenetre inconnue MAIS
+        //    dont le texte est manifestement un menu USSD Mobile Money.
+        if (findEditable(root) != null && containsUssdMarker(collectText(root))) return true;
+
+        return false;
     }
-    private static boolean estEditable(AccessibilityNodeInfo n) {
+
+    /** Concatene les textes visibles (sert au compte rendu serveur). */
+    private String collectText(AccessibilityNodeInfo node) {
+        StringBuilder sb = new StringBuilder();
+        collectTextRec(node, sb, 0);
+        return sb.toString().trim();
+    }
+
+    private void collectTextRec(AccessibilityNodeInfo node, StringBuilder sb, int depth) {
+        if (node == null || depth > 25) return;
+        try {
+            CharSequence t = node.getText();
+            // On ignore le contenu des champs de saisie : c'est le PIN
+            boolean editable = isEditableNode(node);
+            if (!editable && t != null && t.length() > 0) {
+                String s = t.toString().trim();
+                if (!s.isEmpty() && sb.indexOf(s) < 0) {
+                    if (sb.length() > 0) sb.append(" | ");
+                    sb.append(s);
+                }
+            }
+            for (int i = 0; i < node.getChildCount(); i++) {
+                collectTextRec(node.getChild(i), sb, depth + 1);
+            }
+        } catch (Exception ignored) { }
+    }
+
+    // ------------------------------------------------------------------
+    // Champ de saisie
+    // ------------------------------------------------------------------
+
+    private static boolean isEditableNode(AccessibilityNodeInfo n) {
         if (n == null) return false;
         try {
-            if (n.isEditable()) return true;
-            CharSequence c = n.getClassName();
-            return c != null && c.toString().toLowerCase(Locale.ROOT).contains("edittext");
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2 && n.isEditable()) return true;
+            CharSequence cls = n.getClassName();
+            return cls != null && cls.toString().toLowerCase(Locale.ROOT).contains("edittext");
         } catch (Exception e) { return false; }
     }
-    private AccessibilityNodeInfo findEditable(AccessibilityNodeInfo n) { return findEditableRec(n, 0); }
-    private AccessibilityNodeInfo findEditableRec(AccessibilityNodeInfo n, int d) {
-        if (n == null || d > 25) return null;
+
+
+    // ------------------------------------------------------------------
+    // RECHERCHE DE LA BOITE USSD DANS **TOUTES** LES FENETRES.
+    // getRootInActiveWindow() ne rend que la fenetre ACTIVE. Or la boite USSD
+    // appartient a l'application Telephone : quand elle s'affiche par-dessus
+    // une autre application (ou par-dessus l'ecran d'accueil, cas frequent
+    // lorsque l'operateur repond tardivement), la fenetre active reste celle
+    // du dessous. On recuperait alors la mauvaise racine, aucun champ de
+    // saisie n'etait trouve, et RIEN n'etait tape : exactement le "parfois ca
+    // n'ecrit pas" constate sur Airtel quand le menu met du temps a venir.
+    // On balaie donc toutes les fenetres et on retient celle qui porte
+    // vraiment une boite USSD (champ de saisie en priorite).
+    // ------------------------------------------------------------------
+    private AccessibilityNodeInfo racineUssd() {
+        // PRIORITE ABSOLUE : la fenetre au PREMIER PLAN, si c'est bien une boite
+        // USSD. C'est celle que l'utilisateur voit et la seule sur laquelle un
+        // clic (ENVOYER, ANNULER, OK) agit reellement.
+        //
+        // Le balayage de toutes les fenetres ne sert qu'a un cas precis : la
+        // boite USSD affichee PAR-DESSUS une autre application, ou la fenetre
+        // active n'est pas la boite. L'appliquer en premier etait une erreur :
+        // le clic ANNULER de fin de retrait Orange partait vers une autre
+        // fenetre USSD portant un champ de saisie, la boite visible restait
+        // ouverte, la session USSD n'etait jamais liberee — et le retrait
+        // suivant heritait de cette session, d'ou le "numero different du
+        // precedent" et l'echec.
         try {
-            if (estEditable(n) && n.isVisibleToUser()) return n;
-            for (int i = 0; i < n.getChildCount(); i++) { AccessibilityNodeInfo f = findEditableRec(n.getChild(i), d + 1); if (f != null) return f; }
-        } catch (Exception ignore) { }
+            AccessibilityNodeInfo actif = getRootInActiveWindow();
+            if (actif != null && looksLikeUssdDialog(actif, null)) return actif;
+        } catch (Exception ignore) {}
+
+        AccessibilityNodeInfo secours = null;
+        try {
+            java.util.List<AccessibilityWindowInfo> fenetres = getWindows();
+            if (fenetres != null) {
+                for (AccessibilityWindowInfo w : fenetres) {
+                    if (w == null) continue;
+                    AccessibilityNodeInfo r = null;
+                    try { r = w.getRoot(); } catch (Exception ignore) {}
+                    if (r == null) continue;
+                    try {
+                        // CONTROLE OBLIGATOIRE : la fenetre doit etre une boite
+                        // USSD. Se contenter de "il y a un champ de saisie"
+                        // serait dangereux — l'application SMS Gateway elle-meme
+                        // affiche des champs (codes USSD, PIN, URL du serveur) et
+                        // la reponse de menu, voire le code secret, pourrait etre
+                        // tapee dedans au lieu de partir a l'operateur.
+                        if (!looksLikeUssdDialog(r, null)) continue;
+                        if (findEditable(r) != null) return r;   // boite qui attend une saisie
+                        if (secours == null) secours = r;        // boite sans saisie (resultat)
+                    } catch (Exception ignore) {}
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "racineUssd: " + e.getMessage());
+        }
+        if (secours != null) return secours;
+        // Repli : fenetre active, filtree elle aussi par les appelants.
+        try { return getRootInActiveWindow(); } catch (Exception e) { return null; }
+    }
+
+    private AccessibilityNodeInfo findEditable(AccessibilityNodeInfo node) {
+        return findEditableRec(node, 0);
+    }
+
+    private AccessibilityNodeInfo findEditableRec(AccessibilityNodeInfo node, int depth) {
+        if (node == null || depth > 25) return null;
+        try {
+            if (isEditableNode(node) && node.isVisibleToUser()) return node;
+            for (int i = 0; i < node.getChildCount(); i++) {
+                AccessibilityNodeInfo found = findEditableRec(node.getChild(i), depth + 1);
+                if (found != null) return found;
+            }
+        } catch (Exception ignored) { }
         return null;
     }
-    private void ecrireEtValider(String value, Runnable onOk) {
+
+    /** Ecrit le texte dans le champ, avec repli presse-papier si ACTION_SET_TEXT echoue. */
+    /** Nombre d'essais d'ecriture avant d'abandonner un ecran. */
+    private static final int  SAISIE_ESSAIS_MAX = 5;
+    private static final long SAISIE_1ER_DELAI_MS = 350L;
+    private static final long SAISIE_RETRY_MS     = 250L;
+
+    /**
+     * Ecrit une valeur dans le champ, VERIFIE qu'elle y est vraiment, PUIS
+     * seulement valide.
+     *
+     * Pourquoi : ACTION_SET_TEXT renvoie true meme quand la boite de dialogue
+     * est encore en cours d'affichage — le texte n'est alors pas enregistre.
+     * L'ancien code cliquait "Envoyer" apres un simple delai fixe : il arrivait
+     * donc d'envoyer un champ VIDE. L'operateur fermait la session et la
+     * sequence restait bloquee sans que rien ne soit ecrit, exactement le
+     * symptome constate (consultation de solde comme retrait).
+     *
+     * Champ masque (PIN) : le systeme ne rend pas toujours le texte reel. On
+     * verifie alors la LONGUEUR ; au dernier essai on valide quand meme, pour
+     * ne pas casser le cas Orange qui fonctionnait deja.
+     *
+     * @param onValide execute UNIQUEMENT si le clic de validation a reussi.
+     */
+    private void ecrireEtValider(final String value, final int essai, final Runnable onValide) {
+        ecrireEtValider(value, essai, false, onValide);
+    }
+
+    private void ecrireEtValider(final String value, final int essai,
+                                 final boolean ecritureAcceptee, final Runnable onValide) {
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
             try {
                 AccessibilityNodeInfo r = racineUssd();
                 if (r == null) return;
                 AccessibilityNodeInfo champ = findEditable(r);
-                if (champ == null) return;
-                Bundle args = new Bundle();
-                args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value);
-                champ.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
-                new Handler(Looper.getMainLooper()).postDelayed(() -> {
-                    try { AccessibilityNodeInfo r2 = racineUssd(); if (r2 != null && clic(r2, SEND_LABELS, "android:id/button1")) onOk.run(); } catch (Exception ignore) { }
-                }, 350L);
-            } catch (Exception ignore) { }
-        }, 350L);
+                if (champ == null) return;              // boite disparue : un nouvel evenement suivra
+
+                CharSequence cur = champ.getText();
+                String actuel = (cur == null) ? "" : cur.toString().trim();
+                boolean masque = false;
+                try { masque = champ.isPassword(); } catch (Exception ignore) {}
+
+                boolean enPlace = masque ? (actuel.length() == value.length())
+                                         : value.equals(actuel);
+
+                if (!enPlace) {
+                    if (essai >= SAISIE_ESSAIS_MAX) {
+                        // DERNIER RECOURS — ne jamais faire moins bien qu'avant.
+                        // Certains champs (PIN, ROM constructeur) ne restituent
+                        // jamais leur contenu a l'accessibilite : la verification
+                        // echouerait alors indefiniment et le retrait resterait
+                        // fige, alors que l'ancien code validait et fonctionnait.
+                        // Si notre ecriture a ete ACCEPTEE au moins une fois, on
+                        // valide comme avant. Sinon on s'abstient : rien n'a ete
+                        // ecrit, envoyer serait envoyer du vide.
+                        if (ecritureAcceptee) {
+                            Log.d(TAG, "champ non verifiable (masque=" + masque
+                                    + ") -> validation en dernier recours");
+                            if (clickSendButton(r)) onValide.run();
+                        } else {
+                            Log.e(TAG, "champ de saisie toujours vide apres "
+                                    + essai + " essais — aucune validation envoyee");
+                        }
+                        return;
+                    }
+                    // Le champ peut contenir un reliquat : ACTION_SET_TEXT ecrase.
+                    boolean ok = setNodeText(champ, value);
+                    ecrireEtValider(value, essai + 1, ecritureAcceptee || ok, onValide);
+                    return;
+                }
+
+                // Le texte est REELLEMENT dans le champ : on peut valider.
+                if (clickSendButton(r)) {
+                    onValide.run();
+                } else {
+                    Log.e(TAG, "bouton d'envoi introuvable dans la boite USSD");
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "ecrireEtValider: " + e.getMessage());
+            }
+        }, essai == 0 ? SAISIE_1ER_DELAI_MS : SAISIE_RETRY_MS);
     }
-    private boolean clic(AccessibilityNodeInfo root, String[] labels, String viewId) {
+
+    private boolean setNodeText(AccessibilityNodeInfo node, String value) {
+        if (node == null || value == null) return false;
         try {
-            List<AccessibilityNodeInfo> l = root.findAccessibilityNodeInfosByViewId(viewId);
-            if (l != null && !l.isEmpty() && clicNoeud(l.get(0))) return true;
-        } catch (Exception ignore) { }
-        List<AccessibilityNodeInfo> btns = new ArrayList<>();
-        collecterClic(root, btns, 0);
-        boolean cancel = labels == CANCEL_LABELS;
-        for (AccessibilityNodeInfo b : btns) {
-            String lab = labelDe(b);
-            if (lab.isEmpty()) continue;
-            boolean estCancel = estLabel(lab, CANCEL_LABELS);
-            if (cancel ? estCancel : !estCancel) {
-                for (String s : labels) if (lab.equals(s) || lab.startsWith(s)) { if (clicNoeud(b)) return true; }
+            Bundle args = new Bundle();
+            args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value);
+            if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return true;
+
+            // Repli : focus + collage depuis le presse-papier (certaines ROM)
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+            android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                    getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null) {
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("ussd", value));
+                return node.performAction(AccessibilityNodeInfo.ACTION_PASTE);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "setNodeText: " + e.getMessage());
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // Bouton de validation
+    // ------------------------------------------------------------------
+
+    /** Libelles de validation rencontres (fr, mg, en, + ROM constructeurs). */
+    private static final String[] SEND_LABELS = {
+            "envoyer", "send", "ok", "alefa", "valider", "confirmer", "confirm",
+            "continuer", "continue", "suivant", "next", "yes", "eny", "soumettre",
+            "submit", "envoi", "accepter", "accept"
+    };
+
+    /**
+     * Ecran INTERMEDIAIRE d'attente : l'operateur annonce que la demande est en
+     * cours et affiche une boite SANS champ de saisie, avec un bouton OK seul.
+     * Airtel Madagascar en affiche une apres un choix de menu :
+     *   "Eo ampanatontosana ny fangatahana, tsindrio ny ok na mahandrasa kely."
+     * Sans traitement, le service ne trouvait aucun champ editable, ne touchait
+     * a rien, et la sequence restait bloquee sur cette boite jusqu'au delai.
+     * On clique OK pour laisser la session continuer — SANS consommer d'etape
+     * ni avancer dans la sequence : aucune valeur n'est saisie ici.
+     */
+    /**
+     * Boites TRANSITOIRES du systeme, affichees pendant que la demande part et
+     * que l'operateur n'a pas encore repondu. Elles n'ont ni champ de saisie ni
+     * bouton utile. Les fermer ANNULE la session USSD avant le premier menu :
+     * on ne fait donc RIEN, on attend l'ecran suivant.
+     */
+    private static final String[] ECRAN_TRANSITOIRE = {
+            "execution du code ussd", "ex\u00e9cution du code ussd",
+            "execution du code", "ex\u00e9cution du code",
+            "envoi de la demande", "running ussd", "ussd code running",
+            "connexion en cours", "mandefa ny fangatahana"
+    };
+
+    private static boolean ecranTransitoire(String texte) {
+        if (TextUtils.isEmpty(texte)) return false;
+        String t = texte.toLowerCase(Locale.ROOT);
+        for (String m : ECRAN_TRANSITOIRE) if (t.contains(m)) return true;
+        return false;
+    }
+
+    /**
+     * Menus operateur qui restent affiches quand une lecture n'aboutit pas.
+     * Ils ont un champ de saisie : sans regle dediee ils ne sont jamais fermes
+     * et s'empilent jusqu'a bloquer toute nouvelle operation.
+     */
+    private static final String[] BOITE_PARASITE = {
+            "hampiditra tolotra", "achat recharge et offre",
+            "mon compte/mot de passe", "services/factures"
+    };
+
+    /**
+     * Ecran d'offres SEUL, ferme sans condition meme en pleine operation.
+     *
+     * Volontairement plus etroit que boiteParasite : celui-ci reconnait aussi
+     * des lignes du menu principal ("achat recharge et offre", "services/
+     * factures"), et fermer ce menu casserait le retrait qui le traverse. Ici
+     * on ne vise que la liste de forfaits, et on s'assure qu'aucune entree du
+     * menu principal n'y figure.
+     */
+    private static boolean menuOffresSeul(String texte) {
+        if (TextUtils.isEmpty(texte)) return false;
+        String t = texte.toLowerCase(Locale.ROOT);
+        if (!t.contains("hampiditra tolotra")) return false;
+        // Le menu principal propose d'envoyer ou de retirer : ce n'est pas lui.
+        if (t.contains("envoyer argent") || t.contains("retirer argent")) return false;
+        return true;
+    }
+
+    private static boolean boiteParasite(String texte) {
+        if (TextUtils.isEmpty(texte)) return false;
+        String t = texte.toLowerCase(Locale.ROOT);
+        for (String m : BOITE_PARASITE) if (t.contains(m)) return true;
+        return false;
+    }
+
+    private static final String[] ATTENTE_MARKERS = {
+            "ampanatontosana", "fangatahana", "andraso", "mahandrasa",
+            "tsindrio ny ok", "en cours de traitement", "traitement en cours",
+            "veuillez patienter", "patientez", "merci de patienter",
+            "please wait", "processing", "request is being processed",
+            "your request is being"
+    };
+
+    /** true si l'on peut (re)cliquer OK sur cet ecran d'attente maintenant. */
+    private static boolean peutCliquerAttente(String texte) {
+        long now = System.currentTimeMillis();
+        String sig = (texte == null || texte.isEmpty()) ? "<vide>" : texte;
+        if (sig.equals(lastAttenteSignature) && (now - lastAttenteAt) < ATTENTE_REPEAT_MS) {
+            return false;                       // clic tout juste emis sur cette boite
+        }
+        lastAttenteSignature = sig;
+        lastAttenteAt = now;
+        attenteClics++;
+        lastProgressAt = now;      // l'operateur repond : la session avance
+        return true;
+    }
+
+    /**
+     * Un ecran de RESULTAT contient une valeur : montant, solde, identifiant de
+     * transaction. Meme s'il emploie un mot d'attente ("fangatahana voaray..."),
+     * ce n'est PAS un ecran intermediaire : le confondre ferait cliquer OK sans
+     * jamais lire le solde, sur Telma comme sur Orange.
+     */
+    private static final String[] RESULTAT_MARKERS = {
+            "toe bola", "toe-bola", "solde", "trans id", "transaction id",
+            "reference", "ref:", "ariary", " ar ", " fc ", "mga", "montant",
+            "vola voaray", "voaray tsara", "recu", "recus"
+    };
+
+    private static boolean ecranResultat(String texte) {
+        if (TextUtils.isEmpty(texte)) return false;
+        String t = texte.toLowerCase();
+        for (String m : RESULTAT_MARKERS) {
+            if (t.contains(m)) return true;
+        }
+        return false;
+    }
+
+    /** Plafond de clics OK d'attente par operation : evite toute boucle sans fin. */
+    private static final int ATTENTE_CLICS_MAX = 6;
+    private static volatile int attenteClics = 0;
+
+    private static boolean ecranDattente(String texte) {
+        if (TextUtils.isEmpty(texte)) return false;
+        // Un ecran portant une valeur est un resultat, jamais une attente.
+        if (ecranResultat(texte)) return false;
+        if (attenteClics >= ATTENTE_CLICS_MAX) return false;
+        String t = texte.toLowerCase();
+        for (String m : ATTENTE_MARKERS) {
+            if (t.contains(m)) { return true; }
+        }
+        return false;
+    }
+
+    /** Libelles a NE JAMAIS cliquer. */
+    private static final String[] CANCEL_LABELS = {
+            "annuler", "cancel", "aoka", "fermer", "close", "non", "no",
+            "tsia", "retour", "back", "dismiss", "quitter"
+    };
+
+    private boolean clickSendButton(AccessibilityNodeInfo root) {
+        // 1) Identifiants de vue standards Android (les plus fiables)
+        String[] ids = {
+                "android:id/button1",          // bouton positif d'AlertDialog
+                "com.android.phone:id/button1"
+        };
+        for (String id : ids) {
+            AccessibilityNodeInfo n = findByViewId(root, id);
+            if (n != null && clickNode(n)) return true;
+        }
+
+        // 2) Recherche par libelle (multilingue), en excluant les libelles d'annulation
+        List<AccessibilityNodeInfo> buttons = new ArrayList<>();
+        collectClickable(root, buttons, 0);
+        for (AccessibilityNodeInfo b : buttons) {
+            String label = labelOf(b);
+            if (label.isEmpty() || isCancelLabel(label)) continue;
+            for (String s : SEND_LABELS) {
+                if (label.equals(s) || label.startsWith(s)) {
+                    if (clickNode(b)) return true;
+                }
+            }
+        }
+
+        // 3) Dernier repli : s'il n'y a qu'UN SEUL bouton cliquable non-annulation
+        AccessibilityNodeInfo unique = null;
+        int count = 0;
+        for (AccessibilityNodeInfo b : buttons) {
+            String label = labelOf(b);
+            if (isCancelLabel(label)) continue;
+            if (!isButtonLike(b)) continue;
+            count++;
+            unique = b;
+        }
+        if (count == 1 && unique != null) return clickNode(unique);
+
+        return false;
+    }
+
+    /**
+     * Clique volontairement sur ANNULER / CANCEL. Utilise uniquement pour fermer
+     * un ecran dont la transaction est deja terminee — jamais pendant une
+     * transaction en cours.
+     */
+    /** Libelles fermant une boite d'information/erreur. */
+    private static final String[] DISMISS_LABELS = {
+            "ok", "fermer", "close", "annuler", "cancel", "quitter", "hiala", "eny"
+    };
+
+    /**
+     * Ferme une boite d'erreur (bouton OK, ou a defaut le bouton negatif).
+     * Utilise UNIQUEMENT sur un ecran d'echec definitif : aucune transaction
+     * n'est en cours a ce moment, il n'y a donc rien a valider par megarde.
+     */
+    private boolean clickDismissButton(AccessibilityNodeInfo root) {
+        // 1) Boutons standard d'AlertDialog : positif (OK) puis neutre puis negatif
+        String[] ids = {
+            "android:id/button1", "com.android.phone:id/button1",
+            "android:id/button3", "android:id/button2"
+        };
+        for (String id : ids) {
+            AccessibilityNodeInfo n = findByViewId(root, id);
+            if (n != null && clickNode(n)) return true;
+        }
+        // 2) Par libelle
+        List<AccessibilityNodeInfo> buttons = new ArrayList<>();
+        collectClickable(root, buttons, 0);
+        for (AccessibilityNodeInfo b : buttons) {
+            String label = labelOf(b).toLowerCase(Locale.ROOT).trim();
+            if (label.isEmpty()) continue;
+            for (String l : DISMISS_LABELS) {
+                if (label.equals(l) && clickNode(b)) return true;
             }
         }
         return false;
     }
-    private void collecterClic(AccessibilityNodeInfo n, List<AccessibilityNodeInfo> out, int d) {
-        if (n == null || d > 25 || out.size() > 80) return;
-        try {
-            if (n.isVisibleToUser() && (n.isClickable() || estBouton(n))) out.add(n);
-            for (int i = 0; i < n.getChildCount(); i++) collecterClic(n.getChild(i), out, d + 1);
-        } catch (Exception ignore) { }
-    }
-    private static boolean estBouton(AccessibilityNodeInfo n) {
-        try { CharSequence c = n.getClassName(); if (c == null) return false; String s = c.toString().toLowerCase(Locale.ROOT); return s.contains("button") || s.contains("textview"); } catch (Exception e) { return false; }
-    }
-    private static boolean estLabel(String lab, String[] cles) { for (String c : cles) if (lab.equals(c) || lab.startsWith(c)) return true; return false; }
-    private static String labelDe(AccessibilityNodeInfo n) {
-        try { CharSequence t = n.getText(); if (t == null || t.length() == 0) t = n.getContentDescription(); return t == null ? "" : t.toString().trim().toLowerCase(Locale.ROOT); } catch (Exception e) { return ""; }
-    }
-    private boolean clicNoeud(AccessibilityNodeInfo node) {
-        AccessibilityNodeInfo n = node; int g = 0;
-        while (n != null && g++ < 8) {
-            try { if (n.isClickable() && n.isEnabled()) return n.performAction(AccessibilityNodeInfo.ACTION_CLICK); n = n.getParent(); } catch (Exception e) { return false; }
+
+    private boolean clickCancelButton(AccessibilityNodeInfo root) {
+        // 1) Bouton negatif standard d'AlertDialog
+        String[] ids = { "android:id/button2", "com.android.phone:id/button2" };
+        for (String id : ids) {
+            AccessibilityNodeInfo n = findByViewId(root, id);
+            if (n != null && clickNode(n)) return true;
+        }
+        // 2) Par libelle
+        List<AccessibilityNodeInfo> buttons = new ArrayList<>();
+        collectClickable(root, buttons, 0);
+        for (AccessibilityNodeInfo b : buttons) {
+            String label = labelOf(b);
+            if (!label.isEmpty() && isCancelLabel(label) && clickNode(b)) return true;
         }
         return false;
+    }
+
+    private static boolean isCancelLabel(String label) {
+        for (String c : CANCEL_LABELS) {
+            if (label.equals(c) || label.startsWith(c)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isButtonLike(AccessibilityNodeInfo n) {
+        try {
+            CharSequence cls = n.getClassName();
+            if (cls == null) return false;
+            String c = cls.toString().toLowerCase(Locale.ROOT);
+            return c.contains("button") || c.contains("textview");
+        } catch (Exception e) { return false; }
+    }
+
+    private static String labelOf(AccessibilityNodeInfo n) {
+        try {
+            CharSequence t = n.getText();
+            if (t == null || t.length() == 0) t = n.getContentDescription();
+            return t == null ? "" : t.toString().trim().toLowerCase(Locale.ROOT);
+        } catch (Exception e) { return ""; }
+    }
+
+    /** Clique le noeud, ou son premier ancetre cliquable. */
+    private boolean clickNode(AccessibilityNodeInfo node) {
+        AccessibilityNodeInfo n = node;
+        int guard = 0;
+        while (n != null && guard++ < 8) {
+            try {
+                if (n.isClickable() && n.isEnabled()) {
+                    return n.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                }
+                n = n.getParent();
+            } catch (Exception e) { return false; }
+        }
+        return false;
+    }
+
+    private AccessibilityNodeInfo findByViewId(AccessibilityNodeInfo root, String id) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN_MR2) return null;
+        try {
+            List<AccessibilityNodeInfo> list = root.findAccessibilityNodeInfosByViewId(id);
+            if (list != null && !list.isEmpty()) return list.get(0);
+        } catch (Exception ignored) { }
+        return null;
+    }
+
+    private void collectClickable(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> out, int depth) {
+        if (node == null || depth > 25 || out.size() > 80) return;
+        try {
+            if (node.isVisibleToUser() && (node.isClickable() || isButtonLike(node))) out.add(node);
+            for (int i = 0; i < node.getChildCount(); i++) {
+                collectClickable(node.getChild(i), out, depth + 1);
+            }
+        } catch (Exception ignored) { }
     }
 }
